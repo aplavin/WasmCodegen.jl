@@ -410,3 +410,145 @@ end
     @test wasm_run(c, "ct_no_linkage", UInt(64); rettype=Int64)[1] === :trap
 end
 
+## pointers into Julia objects passed to C: a copy of the object, written back (D4)
+
+function ct_refs(a::Int8, b::UInt16, c::Int32, d::Int64, e::Float32, f::Float64, g::Bool)
+    ra, rb, rc, rd, re, rf, rg = Ref(a), Ref(b), Ref(c), Ref(d), Ref(e), Ref(f), Ref(g)
+    ccall((:ct_bump_i8, libctest), Cvoid, (Ref{Int8},), ra)
+    ccall((:ct_bump_u16, libctest), Cvoid, (Ptr{UInt16},), rb)
+    ccall((:ct_bump_i32, libctest), Cvoid, (Ref{Int32},), rc)
+    ccall((:ct_bump_i64, libctest), Cvoid, (Ref{Int64},), rd)
+    ccall((:ct_bump_f32, libctest), Cvoid, (Ref{Float32},), re)
+    ccall((:ct_bump_f64, libctest), Cvoid, (Ptr{Float64},), rf)
+    ccall((:ct_flip, libctest), Cvoid, (Ref{Bool},), rg)
+    q, r = Ref{Cint}(0), Ref{Cint}(0)
+    ccall((:ct_divmod, libctest), Cvoid, (Cint, Cint, Ref{Cint}, Ref{Cint}), Cint(c), Cint(7), q, r)
+    return (ra[], rb[], rc[], rd[], re[], rf[], rg[], q[], r[])
+end
+
+function ct_arrays(n::Int)
+    v = [sin(i) for i in 1:n]
+    s = ccall((:ct_sum_f64, libctest), Float64, (Ptr{Float64}, Csize_t), v, n)
+    s2 = ccall((:ct_sum_f64, libctest), Float64, (Ptr{Float64}, Csize_t), pointer(v, 3), n - 2)   # a part
+    w = Int16[i * 1000 - 7 for i in 1:n]
+    t = ccall((:ct_sum_i16, libctest), Int64, (Ref{Int16}, Csize_t), w, n)
+    f = Float32[i / 4 for i in 1:n]
+    u = ccall((:ct_sum_f32, libctest), Float32, (Ptr{Float32}, Cint), f, n)
+    a = zeros(Int32, n)
+    ccall((:ct_fill_i32, libctest), Cvoid, (Ptr{Int32}, Csize_t, Int32), a, n, Int32(-5))
+    GC.@preserve a ccall((:ct_fill_i32, libctest), Cvoid, (Ptr{Int32}, Csize_t, Int32), pointer(a, n ÷ 2), 2, Int32(100))
+    ccall((:ct_scale_f64, libctest), Cvoid, (Ptr{Float64}, Csize_t, Float64), v, n, 2.0)
+    b = UInt8[i for i in 1:n]
+    ccall((:ct_reverse_u8, libctest), Cvoid, (Ptr{UInt8}, Csize_t), b, n)
+    # two pointers into one array: one copy, as natively one object
+    x = collect(1.0:n)
+    GC.@preserve x ccall((:ct_add_into, libctest), Cvoid, (Ptr{Float64}, Ptr{Float64}, Csize_t), pointer(x, 3), pointer(x, 1), n - 2)
+    # C reads before the pointer, in its object
+    prev = GC.@preserve x ccall((:ct_prev, libctest), Float64, (Ptr{Float64},), pointer(x, 4))
+    return (s, s2, t, u, vdigest(a), vdigest(v), vdigest(b), vdigest(x), prev)
+end
+# larger than the C stack's share: on the C heap
+ct_big_array(n::Int) = ccall((:ct_sum_f64, libctest), Float64, (Ptr{Float64}, Csize_t), [1 / i for i in 1:n], n)
+# a vector deleted at the front: its pointer is not its memory's first element
+function ct_offset_vector(n::Int)
+    v = collect(1.0:n+3)
+    deleteat!(v, 1:3)
+    ccall((:ct_scale_f64, libctest), Cvoid, (Ptr{Float64}, Csize_t, Float64), v, n, -1.0)
+    return vdigest(v)
+end
+# a mutable struct's fields (`Ref` of it, as `Ptr`)
+mutable struct CtPair
+    a::Int32
+    b::Int32
+end
+function ct_mutable_struct(x::Int32)
+    p = CtPair(x, x + Int32(1))
+    ccall((:ct_bump_i32, libctest), Cvoid, (Ptr{Int32},), pointer_from_objref(p))
+    return (p.a, p.b)
+end
+
+function ct_strings(i::Int)
+    s = ("hello, world: foo", "", "ooo")[i]
+    n = ccall((:ct_count_char, libctest), Csize_t, (Cstring, Cchar), s, Cchar('o'))
+    h = ccall((:ct_hash, libctest), UInt32, (Ptr{Cchar},), s)
+    hs = ccall((:ct_hash, libctest), UInt32, (Cstring,), :a_symbol)
+    r = ccall((:ct_repeat, libctest), Ptr{Cchar}, (Cstring, Cint), s, Cint(3))
+    rep = sdigest(unsafe_string(r))
+    Libc.free(r)
+    return (n, h, hs, rep)
+end
+function ct_string_arrays(n::Int)
+    strs = [repeat(string(Char('a' + i)), i) for i in 1:n]
+    t = ccall((:ct_total_len, libctest), Csize_t, (Ptr{Ptr{Cchar}}, Cint), strs, n)
+    t2 = ccall((:ct_total_len, libctest), Csize_t, (Ptr{Cstring}, Cint), strs, n)
+    k = ccall((:ct_count_nonnull, libctest), Cint, (Ptr{Cstring},), strs)
+    # an out-pointer: a string of C's
+    out = Ref{Ptr{Cchar}}(C_NULL)
+    ccall((:ct_get_name, libctest), Cvoid, (Cint, Ref{Ptr{Cchar}}), Cint(2), out)
+    out2 = Ref{Cstring}(C_NULL)
+    ccall((:ct_get_name, libctest), Cvoid, (Cint, Ptr{Cstring}), Cint(3), out2)
+    # pointers C replaces (its strings), and keeps (Julia's)
+    ptrs = [pointer(s) for s in strs]
+    GC.@preserve strs ccall((:ct_replace_odd, libctest), Cvoid, (Ptr{Ptr{Cchar}}, Cint), ptrs, n)
+    names = GC.@preserve strs join([unsafe_string(p) for p in ptrs], ",")
+    return (t, t2, k, sdigest(unsafe_string(out[])), sdigest(unsafe_string(out2[])), sdigest(names))
+end
+# a buffer C writes
+function ct_buffer(x::Int32, y::Float64)
+    buf = zeros(UInt8, 64)
+    r = ccall((:ct_format, libctest), Cint, (Ptr{UInt8}, Csize_t, Cint, Float64), buf, 64, x, y)
+    return sdigest(String(buf[1:r]))
+end
+# an out-pointer to a block of the C heap
+function ct_out_block(n::Int)
+    r = Ref{Ptr{Float64}}(C_NULL)
+    ccall((:ct_alloc_into, libctest), Cvoid, (Ref{Ptr{Float64}}, Csize_t), r, n)
+    p = r[]
+    s = sum(unsafe_load(p, i) for i in 1:n)
+    Libc.free(p)
+    return s
+end
+# a pointer into a memory of references cannot be passed; realloc of a Julia object's pointer
+function ct_pass_references(n::Int)
+    v = Any[1.0 for _ in 1:n]
+    GC.@preserve v ccall((:ct_sum_f64, libctest), Float64, (Ptr{Cvoid}, Csize_t), pointer(v), 0)
+end
+function ct_realloc_owned(n::Int)
+    v = zeros(n)
+    GC.@preserve v Libc.realloc(pointer(v), 16)
+    return n
+end
+# a Julia exception thrown between the copies and the call (here an error of the copy): the C
+# stack is restored (the next calls' space is where it was)
+function ct_stack_after_error(n::Int)
+    sp = ccall((:emscripten_stack_get_current, libctest), UInt64, ())
+    ok = try
+        ct_pass_references(n)
+        false
+    catch e
+        e isa ArgumentError
+    end
+    return (ok, ccall((:emscripten_stack_get_current, libctest), UInt64, ()) == sp)
+end
+
+@testset "C linkage: pointers into Julia objects" begin
+    if HAS_C_TOOLCHAIN
+        @ctest ct_refs(Int8(-3), 0x1234, Int32(77), Int64(-9), 1.5f0, 3.25, false)
+        @ctest ct_arrays(9)
+        @ctest ct_big_array(100_000)
+        @ctest ct_offset_vector(5)
+        @ctest ct_mutable_struct(Int32(41))
+        @ctest ct_strings(1)
+        @ctest ct_strings(2)
+        @ctest ct_strings(3)
+        @ctest ct_string_arrays(5)
+        @ctest ct_buffer(Int32(-42), 3.14159)
+        @ctest ct_out_block(6)
+        @test crun(ct_pass_references, 3)[1] === :trap
+        @test occursin(WasmCodegen.Runtime.CLink.NOT_ADDRESSABLE, LAST_OUTPUT[])
+        @test crun(ct_realloc_owned, 3)[1] === :trap
+        @test occursin(WasmCodegen.Runtime.CLink.REALLOC_OWNED, LAST_OUTPUT[])
+        @test crun(ct_stack_after_error, 3) == (true, true)
+    end
+end
+

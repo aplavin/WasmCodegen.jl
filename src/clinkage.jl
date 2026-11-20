@@ -14,7 +14,11 @@
 #   alignment (as the declared types say: no default promotion, as Julia's `ccall`), as one more
 #   `i64` parameter.
 #
-# (Not yet: pointers into Julia objects, structs by value but of one scalar, variadic calls.)
+# A pointer into a Julia object (with an owner) is passed as the address of a copy of its
+# owner, made for the call (`Runtime.CLink`), and copied back after it into a mutable owner.
+# The space a call needs (copies) is the C stack's (`CLinkage(stack_save, stack_alloc,
+# stack_restore)`), or the C heap's past `stack_limit` bytes, released when the call returns or
+# throws. (Not yet: structs by value but of one scalar, variadic calls.)
 
 "The library of the primitives `Runtime.CLink` calls (`emit_clink_primitive!`)."
 const CLINK_LIBRARY = Runtime.CLink.LIBRARY
@@ -33,6 +37,7 @@ function check_c_linkage(config)
         "Config(c_linkage) with host = :$(config.host): WASI's calls pass data through a memory of ",
         "the module's own, and the C module's memory is the module's only one; use host = :js")))
     isempty(cl.libraries) && throw(ArgumentError("Config(c_linkage): no libraries"))
+    cl.stack_limit >= 0 || throw(ArgumentError("Config(c_linkage): a negative stack_limit"))
     for lib in cl.libraries
         s = String(lib)
         isempty(s) && throw(ArgumentError("Config(c_linkage): an empty library name"))
@@ -171,7 +176,22 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
     end
     any(a -> a.kind === :indirect, [rabi; aabis]) && unsupported("a struct by value (not yet) in a ccall of ", what...)
     nreq > 0 && unsupported("a variadic ccall (not yet) of ", what...)
+    # pointers that may point into Julia objects: copied for the call, and back after it
+    owned = [k for k in eachindex(ATs) if aabis[k].kind === :pointer && !ownerless(vals[k])]
+    space = !isempty(owned)
+    guarded = space && cgm.exceptions !== :none
+    frame = space ? call_runtime!(fc, Runtime.CLink.enter, CGVal[]) : nothing
+    if guarded
+        # (the space is released when the call throws too: the exception thrown on after)
+        block!(fc.b); open_label!(fc)
+        block!(fc.b, RefType(:exn, false)); open_label!(fc)
+        try_table!(fc.b, :empty, [(3, nothing, 0)]); open_label!(fc)
+    end
     params, pushes = ValType[], LeafVal[]
+    addrs = Dict{Int,Int}()
+    for k in owned
+        addrs[k] = c_pointer_address!(fc, vals[k])
+    end
     for k in eachindex(ATs)
         a, v, T = aabis[k], vals[k], ATs[k]
         if a.kind === :scalar
@@ -180,9 +200,7 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
             l = new_local!(fc, t); emit!(fc.b, :local_set, l)
             push!(params, t); push!(pushes, l)
         elseif a.kind === :pointer
-            # (an address in the C module's memory)
-            check_ownerless!(fc, ptr_owner(v), Runtime.CLink.throw_owned_argument)
-            push!(params, I64); push!(pushes, v.leaves[1])
+            push!(params, I64); push!(pushes, get(addrs, k, v.leaves[1]))
         end
     end
     results = rabi.kind === :scalar ? ValType[c_scalar_wtype(rabi.type)] :
@@ -197,7 +215,44 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
     else
         RT === Cvoid || RT === Nothing ? ghost(Nothing, nothing) : ghost(RT, something(ghost_value(RT)))
     end
+    for k in owned
+        call_runtime!(fc, Runtime.CLink.from_c!, CGVal[void_ptr(vals[k])])
+    end
+    if space
+        call_runtime!(fc, Runtime.CLink.leave, CGVal[frame])
+    end
+    if guarded
+        br!(fc.b, 2)
+        end!(fc.b); close_label!(fc)
+        unreachable!(fc.b)
+        end!(fc.b); close_label!(fc)
+        exn = new_local!(fc, RefType(:exn, false))
+        emit!(fc.b, :local_set, exn)
+        call_runtime!(fc, Runtime.CLink.leave, CGVal[frame])
+        emit!(fc.b, :local_get, exn)
+        throw_ref!(fc.b)
+        end!(fc.b); close_label!(fc)
+    end
     return convert_repr(fc, res, typ)
+end
+
+# the pointer `p` as a `Ptr{Cvoid}` (its leaves)
+void_ptr(p::CGVal) = CGVal(Ptr{Cvoid}, Inline, p.leaves)
+
+"""
+The address standing for the pointer argument `p` in the C module's memory: its own without an
+owner, else that of the copy of its owner made for the call (`Runtime.CLink.to_c`). A local.
+"""
+function c_pointer_address!(fc::FnCtx, p::CGVal)
+    a = new_local!(fc, I64)
+    push_leaf!(fc, ptr_owner(p)); emit!(fc.b, :ref_is_null)
+    if!(fc.b, I64)
+    push_leaf!(fc, p.leaves[1])
+    else!(fc.b)
+    push_val!(fc, call_runtime!(fc, Runtime.CLink.to_c, CGVal[void_ptr(p)]))
+    end!(fc.b)
+    emit!(fc.b, :local_set, a)
+    return a
 end
 
 # push the scalar `P` the argument `v` of the declared type `T` is or holds, as the C ABI
@@ -284,22 +339,27 @@ end
 """
     emit_clink_primitive!(fc, name, args, typ) -> CGVal
 
-A primitive of `Runtime.CLink` (a `ccall` of its library): `linked` (a constant of the module),
-the C module's `malloc`, `free`, `calloc`, `realloc` (imports, `malloc` and `free` named by
-`Config(c_linkage)`), `memmove` and `memset` of its memory (`memory.copy`, `memory.fill`), and the
-helper `copy_elements`, generated with the module's types (`finish_clinkage!`). In a module without a C module, which never
+A primitive of `Runtime.CLink` (a `ccall` of its library): `linked` and `stack_limit` (constants
+of the module), the C module's `stack_save`, `stack_alloc`, `stack_restore`, `malloc`, `free`,
+`calloc`, `realloc` (imports, named by `Config(c_linkage)`), `memmove` and `memset` of its memory
+(`memory.copy`, `memory.fill`), and the helpers `owner_nbytes` and `copy_elements`, generated
+with the module's types (`finish_clinkage!`). In a module without a C module, which never
 calls them (`linked()` is false), a trap.
 """
 function emit_clink_primitive!(fc::FnCtx, @nospecialize(name), args::Vector{Any}, @nospecialize(typ))
     cgm = fc.cgm
     cl = cgm.config.c_linkage
     name === :linked && return const_value(fc, cl !== nothing)
+    name === :stack_limit && return const_value(fc, cl === nothing ? 0 : cl.stack_limit)
     if cl === nothing
         unreachable!(fc.b)
         return bottom()
     end
     vals = CGVal[a::CGVal for a in args]
-    imports = (malloc=(cl.malloc, ValType[I64], ValType[I64]), free=(cl.free, ValType[I64], ValType[]),
+    imports = (stack_save=(cl.stack_save, ValType[], ValType[I64]),
+               stack_alloc=(cl.stack_alloc, ValType[I64], ValType[I64]),
+               stack_restore=(cl.stack_restore, ValType[I64], ValType[]),
+               malloc=(cl.malloc, ValType[I64], ValType[I64]), free=(cl.free, ValType[I64], ValType[]),
                calloc=("calloc", ValType[I64, I64], ValType[I64]),
                realloc=("realloc", ValType[I64, I64], ValType[I64]))
     if name in keys(imports)
@@ -312,7 +372,7 @@ function emit_clink_primitive!(fc::FnCtx, @nospecialize(name), args::Vector{Any}
         foreach(v -> push_val!(fc, v), vals)
         emit!(fc.b, name === :memmove ? :memory_copy : :memory_fill, (name === :memmove ? (0, 0) : (0,))...)
         return ghost(Nothing, nothing)
-    elseif name === :copy_elements
+    elseif name === :owner_nbytes || name === :copy_elements
         foreach(v -> push_val!(fc, v), vals)
         call!(fc.b, c_helper!(cgm, name))
         return pop_val!(fc, typ)
@@ -320,23 +380,29 @@ function emit_clink_primitive!(fc::FnCtx, @nospecialize(name), args::Vector{Any}
     unsupported("the primitive ", name, " of Runtime.CLink")
 end
 
-"The function of the helper `name` (`:copy_elements`), whose body `finish_clinkage!` makes."
+"The function of the helper `name` (`:owner_nbytes`, `:copy_elements`), whose body `finish_clinkage!` makes."
 function c_helper!(cgm::CGModule, name::Symbol)
     get!(cgm.helpers, (:clink, name)) do
-        add_func!(cgm.mod, "jl_c_copy_elements", ValType[jlvalue_ref(cgm.types), I64, I64, I64, I32], ValType[I32])
+        jl = jlvalue_ref(cgm.types)
+        name === :owner_nbytes ? add_func!(cgm.mod, "jl_c_owner_nbytes", ValType[jl], ValType[I64]) :
+            add_func!(cgm.mod, "jl_c_copy_elements", ValType[jl, I64, I64, I64, I32], ValType[I32])
     end
 end
 
 """
     finish_clinkage!(cgm)
 
-The body of the helper of `Runtime.CLink` over the module's types, by the type id of the
-object: `jl_c_copy_elements(o, off, c, n, back)`, for a memory whose elements are
+The bodies of the helpers of `Runtime.CLink` over the module's types, by the type id of the
+object: `jl_c_owner_nbytes(o)`, the bytes of `o` as natively laid out (of a string or symbol,
+of a memory whose bytes the pointer helpers address, of a mutable object whose fields they
+address), else -1; `jl_c_copy_elements(o, off, c, n, back)`, for a memory whose elements are
 stored as natively laid out (and a string or symbol), the `n` bytes of its array from its byte
 `off` copied to the C module's memory at `c` (or back), one element at a time (of whole elements
 only: else 0).
 """
 function finish_clinkage!(cgm::CGModule)
+    f = get(cgm.helpers, (:clink, :owner_nbytes), nothing)
+    f === nothing || finish_owner_nbytes!(cgm, f::Func)
     f = get(cgm.helpers, (:clink, :copy_elements), nothing)
     f === nothing || finish_copy_elements!(cgm, f::Func)
 end
@@ -347,6 +413,41 @@ function push_tid_in!(b::Builder, tid::Int, ids)
         emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
         k > 1 && emit!(b, :i32_or)
     end
+end
+
+function finish_owner_nbytes!(cgm::CGModule, f::Func)
+    ts = cgm.types
+    b = Builder(cgm.mod, f)
+    tid = add_local!(f, I32)
+    emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :local_set, tid)
+    for ((st, at, stg), ids) in byte_owners(cgm)
+        push_tid_in!(b, tid, ids)
+        if!(b)
+        emit!(b, :local_get, 0); emit!(b, :ref_cast, st); emit!(b, :struct_get, st, DATA_FIELD)
+        emit!(b, :array_len); emit!(b, :i64_extend_i32_u)
+        s = storage_bytes(stg)
+        s != 1 && (emit!(b, :i64_const, s); emit!(b, :i64_mul))
+        return!(b)
+        end!(b)
+    end
+    for (id, st, at, stg, esz, stride, _) in leaf_memory_owners(cgm)
+        push_tid_in!(b, tid, (id,))
+        if!(b)
+        emit!(b, :local_get, 0); emit!(b, :ref_cast, st); emit!(b, :struct_get, st, DATA_FIELD)
+        emit!(b, :array_len); emit!(b, :i64_extend_i32_u)
+        emit!(b, :i64_const, stride); emit!(b, :i64_div_u)
+        emit!(b, :i64_const, esz); emit!(b, :i64_mul)
+        return!(b)
+        end!(b)
+    end
+    for (id, _, _) in object_owners(cgm)
+        push_tid_in!(b, tid, (id,))
+        if!(b)
+        emit!(b, :i64_const, sizeof(cgm.types.typelist[id])); return!(b)
+        end!(b)
+    end
+    emit!(b, :i64_const, -1)
+    finish!(b)
 end
 
 function finish_copy_elements!(cgm::CGModule, f::Func)

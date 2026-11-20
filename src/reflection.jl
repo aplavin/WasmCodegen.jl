@@ -549,14 +549,21 @@ end
 """
 The functions `Runtime.by_type` calls by the type of a value, and the types of the module each
 has a case for (of the module's concrete types): `Base.wait` of each type Base has a `wait`
-for (`Runtime.Tasks.wait_as`, for `@sync`), and `showerror` of each exception type whose
+for (`Runtime.Tasks.wait_as`, for `@sync`), `showerror` of each exception type whose
 `showerror` the module can compile, as juliac checks code (`Runtime.showerror_as`, for
-`Host.error_text`).
+`Host.error_text`), and the copies of the objects holding pointers a call into a C module
+copies element by element (`Runtime.CLink`).
 """
 const BY_TYPE_CASES = IdDict{Any,Function}(
     Runtime.Tasks.wait_as => (world, @nospecialize(T)) ->
         !(T <: Task) && !(T <: Base.UnwrapTaskFailedException) && hasmethod(Base.wait, Tuple{T}; world),
-    Runtime.showerror_as => (world, @nospecialize(T)) -> T <: Exception && trim_safe_showerror(T, world))
+    Runtime.showerror_as => (world, @nospecialize(T)) -> T <: Exception && trim_safe_showerror(T, world),
+    # the copies for a call into a C module of the memories and `Ref`s of pointers, or of values
+    # holding pointers (`Runtime.CLink`), element by element, and back
+    Runtime.CLink.pointers_to_c => (world, @nospecialize(T)) -> Runtime.CLink.holds_pointers(T),
+    Runtime.CLink.pointers_from_c => (world, @nospecialize(T)) -> Runtime.CLink.holds_pointers(T),
+    Runtime.CLink.values_to_c => (world, @nospecialize(T)) -> Runtime.CLink.holds_values(T),
+    Runtime.CLink.values_from_c => (world, @nospecialize(T)) -> Runtime.CLink.holds_values(T))
 
 # whether `showerror(::IOBuffer, ::T)` is trim-safe in `world` (once per type, for the world
 # last asked about: the answers of another world are dropped)

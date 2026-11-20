@@ -16,8 +16,16 @@ The linkage of a module with one C module compiled to Wasm (`Config(c_linkage)`,
   libraries are as without a C module;
 - `import_module`: the module name of the imports (`"c"`);
 - `memory`: the name of the C module's memory export, imported as the module's memory;
-- `malloc`, `free`: the C module's allocator, for `Libc.malloc`, `Libc.free` (and `Libc.calloc`,
-  `Libc.realloc`, imported by their own names);
+- `stack_save`, `stack_alloc`, `stack_restore`: the C module's exports that read the C stack
+  pointer, allocate on the C stack (`(size) -> address`, aligned to 16) and restore it, for the
+  space a call needs (copies of arguments, results, variadic arguments): emscripten's
+  `emscripten_stack_get_current`, `_emscripten_stack_alloc`, `_emscripten_stack_restore`
+  (exported with `-sEXPORTED_FUNCTIONS=...,_emscripten_stack_get_current,__emscripten_stack_alloc,__emscripten_stack_restore`);
+- `malloc`, `free`: the C module's allocator, for that space beyond `stack_limit` bytes per call
+  (so that copies of large arrays cannot overflow the C stack), and for `Libc.malloc`,
+  `Libc.free` (and `Libc.calloc`, `Libc.realloc`, imported by their own names);
+- `stack_limit`: the bytes of the C stack one call may use for its space (16 KiB; emscripten's
+  stack is 64 KiB by default);
 - `memory64`: must be `true`: only C modules with a 64-bit memory are supported (their
   pointers, `size_t` and `long` are 8 bytes, as Julia's on 64-bit platforms, so that structs
   are laid out as natively).
@@ -26,8 +34,12 @@ Base.@kwdef struct CLinkage
     libraries::Vector{Union{String,Symbol}}
     import_module::String = "c"
     memory::String = "memory"
+    stack_save::String = "emscripten_stack_get_current"
+    stack_alloc::String = "_emscripten_stack_alloc"
+    stack_restore::String = "_emscripten_stack_restore"
     malloc::String = "malloc"
     free::String = "free"
+    stack_limit::Int = 16384
     memory64::Bool = true
 end
 
