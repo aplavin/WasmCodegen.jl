@@ -18,35 +18,31 @@ function foreigncall_name(@nospecialize(x))
     return nothing
 end
 
-# the library of a foreign call `ccall((name, library), ...)`, a `String` or a `Symbol`, in the
-# forms `foreigncall_name` accepts: a constant, or a global variable, constant or not, by its
-# value in the program's `world` now (a JLL package's `libfoo`, set by its `__init__`: the
-# module is a snapshot of the build process, and the library its calls mean is the one the
-# build process has)
-function foreigncall_library(@nospecialize(x), world::UInt)
+# the library of a foreign call `ccall((name, library), ...)` given as a constant string, in
+# the forms `foreigncall_name` accepts
+function foreigncall_library(@nospecialize(x))
     x isa QuoteNode && (x = x.value)
-    x isa Tuple && return length(x) == 2 && x[2] isa Union{String,Symbol} ? x[2] : nothing
-    x isa GlobalRef && return foreigncall_library(something(global_value(world, x), Some{Any}(nothing)), world)
-    lib = if x isa Expr && x.head === :call && length(x.args) == 3 &&
-             (x.args[1] === Core.tuple || x.args[1] == GlobalRef(Core, :tuple))
-        # `Core.tuple(name, library)` (Julia 1.12; the callee is a `GlobalRef` in its IR)
-        x.args[3]
-    elseif x isa Expr && x.head === :tuple && length(x.args) == 2
-        # (name, library) (Julia 1.13)
-        x.args[2]
-    else
-        nothing
-    end
+    x isa Tuple && return length(x) == 2 && x[2] isa String ? x[2] : nothing
+    x isa GlobalRef && isconst(x.mod, x.name) && return foreigncall_library(getglobal(x.mod, x.name))
+    lib = foreigncall_library_expr(x)
     lib isa QuoteNode && (lib = lib.value)
-    # (a global naming it: `Base.PCRE.PCRE_LIB`, a constant; a JLL's `libfoo`, set at its load)
-    lib isa GlobalRef && (lib = something(global_value(world, lib), Some{Any}(nothing)))
-    return lib isa Union{String,Symbol} ? lib : nothing
+    # (a constant naming it: `Base.PCRE.PCRE_LIB`)
+    lib isa GlobalRef && isconst(lib.mod, lib.name) && (lib = getglobal(lib.mod, lib.name))
+    return lib isa String ? lib : nothing
 end
 
-# the value of the global `ref` in `world`, constant or not, or nothing where it is undefined
-function global_value(world::UInt, ref::GlobalRef)
-    Base.invoke_in_world(world, isdefinedglobal, ref.mod, ref.name) || return nothing
-    return Some{Any}(Base.invoke_in_world(world, getglobal, ref.mod, ref.name))
+# the expression of the library of a foreign call `ccall((name, library), ...)` in its IR, or
+# nothing (a bare name, or no name)
+function foreigncall_library_expr(@nospecialize(x))
+    if x isa Expr && x.head === :call && length(x.args) == 3 &&
+       (x.args[1] === Core.tuple || x.args[1] == GlobalRef(Core, :tuple))
+        # `Core.tuple(name, library)` (Julia 1.12; the callee is a `GlobalRef` in its IR)
+        return x.args[3]
+    elseif x isa Expr && x.head === :tuple && length(x.args) == 2
+        # (name, library) (Julia 1.13)
+        return x.args[2]
+    end
+    return nothing
 end
 
 ## libraries of host imports the program declares (`Config(import_libraries)`)
@@ -232,17 +228,25 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     name = foreigncall_name(ex.args[1])
     nargs = length(ex.args[3]::Core.SimpleVector)
     args = Any[operand(fc, a) for a in ex.args[6:5+nargs]]
-    lib = foreigncall_library(ex.args[1], fc.cgm.world.world)
+    lib = foreigncall_library(ex.args[1])
     # (a function the program implements, before the host's of a library it declares)
     if lib == SIMD128.LIBRARY && name isa Symbol && startswith(String(name), "wasm_simd_")
         return emit_simd!(fc, String(name)[11:end], args, typ)   # SIMD128 (simd128.jl)
     end
     f = foreign_function(fc.cgm.config, name, lib)
     f === nothing || return emit_foreign_function!(fc, f, name::Symbol, lib::String, ex, args, typ)
-    # a function of the C module (`Config(c_linkage)`, clinkage.jl), or its allocator's for
-    # `Libc.malloc` and the like
-    if name isa Symbol && is_c_function(fc.cgm, lib, name)
-        return emit_c_call!(fc, name, ex, args, typ)
+    # a function of the C module (`Config(c_linkage)`, clinkage.jl), by the library's value when
+    # compiling, or its allocator's for `Libc.malloc` and the like (a bare name)
+    clib = name isa Symbol && c_linked(fc) ? c_library(ex.args[1], fc.cgm.world.world) : nothing
+    if clib === nothing
+        name isa Symbol && c_linked(fc) && name in C_ALLOCATOR_FUNCTIONS && return emit_c_allocator!(fc, name, args, typ)
+    elseif clib isa UnresolvedLibrary
+        # (it may be the C module's: said so, and never taken for a bare name)
+        unsupported("the ccall of ", name, " whose library, ", clib.expr, ", is not known when compiling: with a ",
+                    "C module (Config(c_linkage)) a ccall's library must be a constant or a global variable ",
+                    "(constant or not) holding a String, a Symbol or a Libdl.LazyLibrary")
+    elseif is_c_library(fc.cgm, clib)
+        return emit_c_call!(fc, name::Symbol, clib, ex, args, typ)
     end
     lib == CLINK_LIBRARY && return emit_clink_primitive!(fc, name, args, typ)
     if lib !== nothing && name !== nothing && (lib in IMPORT_LIBRARIES || lib in fc.cgm.config.import_libraries)

@@ -355,6 +355,25 @@ ct_bad_two(x::Int32) = ccall((:ct_mul32, libctest), Int32, (Int32, Int32), x, x)
 ct_bad_bytes(v::Vector{UInt8}) = ccall((:send, "ct_host"), Cvoid, (Vector{UInt8},), v)
 # (a C library not linked: as without a C module)
 ct_other_lib(x::Int32) = ccall((:ct_mul32, "libother"), Int32, (Int32, Int32), x, x)
+# the library through a constant and a global variable holding the same value; a Symbol; a
+# Libdl.LazyLibrary (a newer JLL's library product), of a path or of a LazyLibraryPath
+global libctest_sym::Symbol = :none
+global libctest_lazy::Any = nothing
+global libctest_lazypath::Any = nothing
+ct_lib_forms(x::Int32) = (ccall((:ct_mul32, LIBCTEST_CONST), Int32, (Int32, Int32), x, Int32(3)),
+                          ccall((:ct_mul32, libctest), Int32, (Int32, Int32), x, Int32(3)))
+ct_lib_sym(x::Int32) = ccall((:ct_mul32, libctest_sym), Int32, (Int32, Int32), x, Int32(5))
+ct_lib_lazy(x::Int32) = (ccall((:ct_mul32, libctest_lazy), Int32, (Int32, Int32), x, Int32(7)),
+                         ccall((:ct_mul32, libctest_lazypath), Int32, (Int32, Int32), x, Int32(9)))
+# a library not known when compiling: an undefined global, a value of another type (with a C
+# module: said so, never a bare name such as Libc's `malloc`)
+ct_lib_undefined() = ccall((:malloc, ct_no_such_lib), Ptr{Cvoid}, (Csize_t,), 8)
+global ct_lib_number::Any = 42
+ct_lib_wrongtype(x::Int32) = ccall((:ct_mul32, ct_lib_number), Int32, (Int32, Int32), x, x)
+# without a C module, a library is resolved as before it: through constants only, so a global
+# variable naming a library of host imports is not one of them
+global ct_host_lib::String = "ct_host"
+ct_host_nonconst(x::Int32) = ccall((:send2, ct_host_lib), Int32, (Int32,), x)
 # without a C module, a pointer without owner cannot be dereferenced
 ct_no_linkage(x::UInt) = unsafe_load(Ptr{Int64}(x))
 
@@ -376,6 +395,25 @@ end
             @test occursin(WasmCodegen.Runtime.CLink.OWNED_STORE, LAST_OUTPUT[])
         end
         @ctest ct_store_address(UInt(1) << 40)
+        @eval const LIBCTEST_CONST = $libctest
+        global libctest_sym = Symbol(libctest)
+        global libctest_lazy = Base.Libc.Libdl.LazyLibrary(libctest)
+        global libctest_lazypath = Base.Libc.Libdl.LazyLibrary(Base.Libc.Libdl.LazyLibraryPath(dirname(libctest), basename(libctest)))
+        @ctest ct_lib_forms(Int32(6))
+        c = ccompile(ct_lib_forms, (Int32,))
+        @test count(f -> f.imported == ("c", "ct_mul32"), c.cgm.mod.funcs) == 1
+        c = WasmCodegen.compile(ct_lib_sym, (Int32,); config=test_config(c_linkage=CLinkage(libraries=[Symbol(libctest)])))
+        @test wasm_run(c, "ct_lib_sym", Int32(4); rettype=Int32, cmodule=CTEST_JS[]) === ct_lib_sym(Int32(4))
+        for libs in ([libctest_lazy], [libctest])
+            c = WasmCodegen.compile(ct_lib_lazy, (Int32,); config=test_config(c_linkage=CLinkage(libraries=libs)))
+            @test wasm_run(c, "ct_lib_lazy", Int32(4); rettype=Tuple{Int32,Int32}, cmodule=CTEST_JS[]) === ct_lib_lazy(Int32(4))
+        end
+        # (a Symbol is not the String of its name)
+        @test_throws "the foreign call ct_mul32" WasmCodegen.compile(ct_lib_sym, (Int32,); config=ctest_config())
+        msg = ct_unsupported(ct_lib_wrongtype, (Int32,))
+        @test msg isa String && occursin("the ccall of ct_mul32 whose library", msg) && occursin("is not known when compiling", msg)
+        msg = ct_unsupported(ct_lib_undefined, ())
+        @test msg isa String && occursin("the ccall of malloc whose library", msg)
     end
     # (compiling needs no C toolchain)
     for (f, T, what) in [(ct_bad_any, (Int32,), "the type Any by value"),
@@ -394,9 +432,15 @@ end
     @test msg isa String && occursin("unsafe_wrap: an array cannot share the bytes", msg)
     msg = ct_unsupported(ct_other_lib, (Int32,))
     @test msg isa String && occursin("the foreign call ct_mul32", msg)
-    # the library's identity: its value when compiling, equal as a String
+    # the library's identity: its value when compiling, of its type (a Symbol is not the String)
     msg = ct_unsupported(ct_count_more, (); config=test_config(c_linkage=CLinkage(libraries=[Symbol(libctest)])))
     @test msg isa String && occursin("the foreign call ct_count", msg)
+    # a global variable naming a library of host imports: unsupported, with or without a C module
+    for config in (test_config(import_libraries=["ct_host"]),
+                   test_config(import_libraries=["ct_host"], c_linkage=CLinkage(libraries=[libctest])))
+        msg = ct_unsupported(ct_host_nonconst, (Int32,); config)
+        @test msg isa String && occursin("the foreign call send2", msg)
+    end
     c = ccompile(ct_count_more, ())
     @test any(f -> f.imported == ("c", "ct_count"), c.cgm.mod.funcs)
     # configurations

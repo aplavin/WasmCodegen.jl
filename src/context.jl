@@ -8,12 +8,17 @@ The linkage of a module with one C module compiled to Wasm (`Config(c_linkage)`,
 `-m64` builds and clang's `wasm64` target make), whose exports the module imports.
 
 - `libraries`: the identities of the libraries whose functions are the C module's: a
-  `ccall((name, lib), ...)` whose `lib` is one of them (equal as a `String` or a `Symbol`) is a
-  call of the import `import_module.name`. `lib` is resolved when the module is compiled: a
-  constant, or a global variable, constant or not, by its value in the build process then (as
-  a JLL package's `__init__` sets `libfoo` to the path of its library: the path the build
-  process has is what counts, the image being a snapshot of that process). Calls of other
-  libraries are as without a C module;
+  `ccall((name, lib), ...)` whose `lib` is one of them is a call of the import
+  `import_module.name`. An identity is a `String` (a path or a name), a `Symbol`, or a
+  `Libdl.LazyLibrary` (a newer JLL package's library product), which stands for its path in the
+  build process; two are the same library when they are equal and of one type (a `String` is
+  never a `Symbol`). `lib` is resolved when the module is compiled: a constant, or a global
+  variable, constant or not, by its value in the build process then (as a JLL package's
+  `__init__` sets `libfoo` to the path of its library: the path the build process has is what
+  counts, the image being a snapshot of that process; a reassignment when the module runs
+  changes nothing). Calls of other libraries are as without a C module; a call whose library is
+  not known when compiling (an expression, an undefined global, a value of another type) is an
+  unsupported construct saying so;
 - `import_module`: the module name of the imports (`"c"`);
 - `memory`: the name of the C module's memory export, imported as the module's memory;
 - `stack_save`, `stack_alloc`, `stack_restore`: the C module's exports that read the C stack
@@ -31,7 +36,7 @@ The linkage of a module with one C module compiled to Wasm (`Config(c_linkage)`,
   are laid out as natively).
 """
 Base.@kwdef struct CLinkage
-    libraries::Vector{Union{String,Symbol}}
+    libraries::Vector{Union{String,Symbol,Base.Libc.Libdl.LazyLibrary}}
     import_module::String = "c"
     memory::String = "memory"
     stack_save::String = "emscripten_stack_get_current"

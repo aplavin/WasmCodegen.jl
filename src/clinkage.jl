@@ -56,13 +56,14 @@ function check_c_linkage(config)
     isempty(cl.libraries) && throw(ArgumentError("Config(c_linkage): no libraries"))
     cl.stack_limit >= 0 || throw(ArgumentError("Config(c_linkage): a negative stack_limit"))
     for lib in cl.libraries
-        s = String(lib)
+        id = c_library_id(lib)
+        s = string(id)
         isempty(s) && throw(ArgumentError("Config(c_linkage): an empty library name"))
         reserved_import_library(s) &&
             throw(ArgumentError("Config(c_linkage): \"$s\" is a name of WasmCodegen's own imports"))
-        lib in config.import_libraries &&
+        any(l -> same_library(l, id), config.import_libraries) &&
             throw(ArgumentError("Config(c_linkage): \"$s\" is also a library of host imports (import_libraries)"))
-        any(((_, l),) -> l == lib, first.(config.foreign_functions)) &&
+        any(((_, l),) -> same_library(l, id), first.(config.foreign_functions)) &&
             throw(ArgumentError("Config(c_linkage): \"$s\" is also a library of foreign_functions"))
     end
     reserved_import_library(cl.import_module) &&
@@ -73,15 +74,75 @@ end
 c_linked(cgm::CGModule) = cgm.config.c_linkage !== nothing
 c_linked(fc::FnCtx) = c_linked(fc.cgm)
 
+## the libraries of the C module
+
+"A library of a foreign call whose value is not known when compiling (`c_library`): its expression."
+struct UnresolvedLibrary
+    expr::Any
+end
+
 """
-Whether `ccall((name, lib), ...)` (`lib` a `String`, a `Symbol` or `nothing`) is a call of the
-C module: of one of its libraries, or of `Libc`'s allocator.
+    c_library_id(lib, world) -> Union{String,Symbol,UnresolvedLibrary}
+
+The identity of the library value `lib`: a `String` (a path, or a name) or a `Symbol` as it is; a
+`Libdl.LazyLibrary` (what newer JLL packages' library products are, and Julia's own) its path
+as it is in the build process (`string` of its `path`: a `String`, a `LazyLibraryPath` joining
+its pieces, a `BundledLazyLibraryPath` from Julia's own directory), which is the library it
+opens. Anything else (a handle, a function) cannot be resolved.
 """
-function is_c_function(cgm::CGModule, @nospecialize(lib), name::Symbol)
+function c_library_id(@nospecialize(lib), world::UInt=Base.get_world_counter())
+    lib isa Union{String,Symbol} && return lib
+    lib isa Base.Libc.Libdl.LazyLibrary && return Base.invoke_in_world(world, string, lib.path)::String
+    return UnresolvedLibrary(lib)
+end
+
+"""
+    c_library(x, world) -> Union{Nothing,String,Symbol,UnresolvedLibrary}
+
+The library of a foreign call `ccall((name, library), ...)` (`x` its first argument in the IR)
+for the C linkage: `nothing` for a bare name (`ccall(:name, ...)`); else the identity
+(`c_library_id`) of the library's value when the module is compiled: of a constant, or of a
+global variable, constant or not, by its value in the build process then (a JLL package's
+`libfoo`, which its `__init__` sets: the image is a snapshot of the build process, and a
+reassignment of the variable when the module runs changes nothing), or `UnresolvedLibrary`.
+"""
+function c_library(@nospecialize(x), world::UInt)
+    x isa QuoteNode && (x = x.value)
+    x isa Union{Symbol,String} && return nothing
+    x isa Tuple && return length(x) == 1 ? nothing : length(x) == 2 ? c_library_id(x[2], world) : UnresolvedLibrary(x)
+    # (a bare name in a tuple: `(:name,)`, Julia 1.13's `Libc.calloc`)
+    x isa Expr && ((x.head === :tuple && length(x.args) == 1) ||
+                   (x.head === :call && length(x.args) == 2 && (x.args[1] === Core.tuple || x.args[1] == GlobalRef(Core, :tuple)))) &&
+        return nothing
+    if x isa GlobalRef
+        v = global_value(world, x)
+        return v === nothing ? UnresolvedLibrary(x) : c_library(something(v), world)
+    end
+    lib = foreigncall_library_expr(x)
+    lib === nothing && return UnresolvedLibrary(x)
+    lib isa QuoteNode && (lib = lib.value)
+    if lib isa GlobalRef
+        v = global_value(world, lib)
+        v === nothing && return UnresolvedLibrary(lib)
+        lib = something(v)
+    end
+    return lib isa Union{Expr,Core.SSAValue,Core.Argument,Core.SlotNumber} ? UnresolvedLibrary(lib) : c_library_id(lib, world)
+end
+
+# the value of the global `ref` in `world`, constant or not, or nothing where it is undefined
+function global_value(world::UInt, ref::GlobalRef)
+    Base.invoke_in_world(world, isdefinedglobal, ref.mod, ref.name) || return nothing
+    return Some{Any}(Base.invoke_in_world(world, getglobal, ref.mod, ref.name))
+end
+
+"Whether two library identities (`c_library_id`) are the same library: of one type, and equal."
+same_library(@nospecialize(a), @nospecialize(b)) = typeof(a) === typeof(b) && a == b
+
+"Whether the library identity `lib` (`c_library`) is one of the C module's (`CLinkage(libraries)`)."
+function is_c_library(cgm::CGModule, @nospecialize(lib))
     cl = cgm.config.c_linkage
-    cl === nothing && return false
-    lib === nothing && return name in C_ALLOCATOR_FUNCTIONS
-    return lib in cl.libraries
+    (cl === nothing || lib isa UnresolvedLibrary) && return false
+    return any(l -> same_library(c_library_id(l, cgm.world.world), lib), cl.libraries)
 end
 
 ## the C ABI of wasm64
@@ -159,16 +220,15 @@ end
 ## calls
 
 """
-    emit_c_call!(fc, name, ex, args, typ) -> CGVal
+    emit_c_call!(fc, name, lib, ex, args, typ) -> CGVal
 
-`ccall((name, lib), RT, (AT...), args...)` of a library of the C module: a call of its export
+`ccall((name, lib), RT, (AT...), args...)` of a library of the C module (`lib` its identity,
+`c_library`): a call of its export
 `name`, imported (`import_module.name`) with the Wasm type the C ABI gives the declared
 signature (one import per name: calls declaring other signatures are an error). See the
 beginning of this file.
 """
-function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nospecialize(typ))
-    lib = foreigncall_library(ex.args[1], fc.cgm.world.world)
-    lib === nothing && return emit_c_allocator!(fc, name, args, typ)
+function emit_c_call!(fc::FnCtx, name::Symbol, @nospecialize(lib), ex::Expr, args::Vector{Any}, @nospecialize(typ))
     cgm = fc.cgm
     cl = cgm.config.c_linkage::CLinkage
     RT = ex.args[2]

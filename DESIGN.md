@@ -718,13 +718,21 @@ functions its `ccall`s name (`clinkage.jl`). This is how unmodified bindings run
 strings, its variadic `igText`, and its accessors `unsafe_load(Ptr{ImVec2}(io + 8))` of structs
 C owns.
 
-- **Libraries.** A `ccall`'s library is resolved when the module is compiled, to its value in
-  the build process: a constant, or a global variable, constant or not (the image is a
-  snapshot of that process; a JLL's path is the one it has). It is the C module's when equal
-  (as a `String` or a `Symbol`) to one of `libraries`; calls of others are as without a C
-  module. Only `host = :js`: WASI's calls pass data in a memory of the module's own, at
-  offsets of its own, as do the byte arguments of `import_libraries`' imports (an unsupported
-  construct with a C module); none may write the C module's memory.
+- **Libraries.** For the C linkage, a `ccall`'s library is resolved when the module is
+  compiled, to its value in the build process: of a constant, or of a global variable, constant
+  or not (the image is a snapshot of that process; a JLL's path is the one it has, and a
+  reassignment of the variable when the module runs changes nothing). Its identity is that
+  value, a `String` or a `Symbol`, or for a `Libdl.LazyLibrary` (what newer JLL packages'
+  library products are, `LazyLibrary(LazyLibraryPath(artifact_dir, "lib", "libfoo.so"))`) the
+  path it opens, `string(lib.path)`. The call is the C module's when its identity is one of
+  `libraries`' (equal and of one type: a `String` is never a `Symbol`); calls of other libraries
+  are as without a C module. A named call whose library cannot be resolved (an undefined
+  global, a value of another type: a handle, a function) is an unsupported construct saying so,
+  never taken for a bare name (`ccall(:malloc, ...)`, `Libc`'s allocator). Without a C module
+  libraries are resolved as before (constant strings only), so nothing changes. Only `host =
+  :js`: WASI's calls pass data in a memory of the module's own, at offsets of its own, as do the
+  byte arguments of `import_libraries`' imports (an unsupported construct with a C module); none
+  may write the C module's memory.
 - **Pointers without owner are C addresses** (`pointers.jl`). The null owner of a pointer made
   from an integer (section 5) is the C module's memory, as natively: a load or store through
   one is the memory's instruction for each primitive leaf (little-endian, as Julia lays out
