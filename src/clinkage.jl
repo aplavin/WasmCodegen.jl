@@ -189,7 +189,7 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
     copies = !isempty(owned) || any(k -> aabis[k].kind !== :pointer && maybe_owned(vals[k], ATs[k]), fixed)
     space = rabi.kind === :indirect || variadic || copies || any(a -> a.kind === :indirect, aabis)
     guarded = space && cgm.exceptions !== :none
-    frame = space ? call_runtime!(fc, Runtime.CLink.enter, CGVal[]) : nothing
+    frame = space ? materialize!(fc, call_runtime!(fc, Runtime.CLink.open_frame, CGVal[])) : nothing
     if guarded
         # (the space is released when the call throws too: the exception thrown on after)
         block!(fc.b); open_label!(fc)
@@ -239,15 +239,14 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
         RT === Cvoid || RT === Nothing ? ghost(Nothing, nothing) : ghost(RT, something(ghost_value(RT)))
     end
     if copies
-        # (a pointer C returns into a copy is into its object; the copies of mutable objects
-        # written back, while all are alive)
+        # (a pointer C returns into a copy is into its object: mapped while the copies are
+        # alive, until `close_frame` writes them back and drops them)
         if rabi.kind === :pointer || (rabi.kind === :scalar && is_ptr_type(rabi.type))
             res = CGVal(RT, Inline, c_back_pointer!(fc, res.leaves[1], CallFrame(nothing), nothing).leaves)
         end
-        call_runtime!(fc, Runtime.CLink.back!, CGVal[frame])
     end
     if space
-        call_runtime!(fc, Runtime.CLink.leave, CGVal[frame])
+        call_runtime!(fc, Runtime.CLink.close_frame, CGVal[CGVal(Int, Inline, LeafVal[frame])])
     end
     if guarded
         br!(fc.b, 2)
@@ -256,7 +255,7 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
         end!(fc.b); close_label!(fc)
         exn = new_local!(fc, RefType(:exn, false))
         emit!(fc.b, :local_set, exn)
-        call_runtime!(fc, Runtime.CLink.leave, CGVal[frame])
+        call_runtime!(fc, Runtime.CLink.release_frame, CGVal[CGVal(Int, Inline, LeafVal[frame])])
         emit!(fc.b, :local_get, exn)
         throw_ref!(fc.b)
         end!(fc.b); close_label!(fc)

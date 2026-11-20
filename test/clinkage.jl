@@ -604,6 +604,21 @@ ct_ref_fields(x::Float64) = (o = CtWithRef(x, "a");
 ct_ref_fields_dynamic(x::Float64) = (o = CtWithRef(x, "a");
     GC.@preserve o ccall((:ct_bump_f64, libctest), Cvoid, (Ptr{Float64},), ct_object_ptr(o)); o.x)
 
+# a module where nothing catches (a Julia exception traps): a call that traps midway, having
+# copied `CT_BUF` (on the C heap: larger than the stack's share), leaves its copy behind; a later
+# call of another export copying the same object must not reuse it, nor write it back
+const CT_BUF = zeros(4000)
+function ct_trap_midway(n::Int)
+    v = Any[1.0]
+    GC.@preserve v ccall((:ct_add_into, libctest), Cvoid, (Ptr{Float64}, Ptr{Float64}, Csize_t), CT_BUF, pointer(v), 0)
+    return n
+end
+function ct_after_trap(x::Float64)
+    fill!(CT_BUF, x)
+    ccall((:ct_scale_f64, libctest), Cvoid, (Ptr{Float64}, Csize_t, Float64), CT_BUF, length(CT_BUF), 2.0)
+    return (sum(CT_BUF), ccall((:ct_sum_f64, libctest), Float64, (Ptr{Float64}, Csize_t), CT_BUF, 3))
+end
+
 @testset "C linkage: pointers into Julia objects" begin
     if HAS_C_TOOLCHAIN
         @ctest ct_refs(Int8(-3), 0x1234, Int32(77), Int64(-9), 1.5f0, 3.25, false)
@@ -632,6 +647,14 @@ ct_ref_fields_dynamic(x::Float64) = (o = CtWithRef(x, "a");
         @test crun(ct_realloc_owned, 3)[1] === :trap
         @test occursin(WasmCodegen.Runtime.CLink.REALLOC_OWNED, LAST_OUTPUT[])
         @test crun(ct_stack_after_error, 3) == (true, true)
+        c = WasmCodegen.compile([(ct_trap_midway, (Int,)), (ct_after_trap, (Float64,))]; config=ctest_config())
+        @test c.cgm.exceptions === :none
+        expected = ct_after_trap(1.5)
+        @test wasm_run(c, "ct_trap_midway", 1; rettype=Int, cmodule=CTEST_JS[])[1] === :trap
+        @test occursin(WasmCodegen.Runtime.CLink.NOT_ADDRESSABLE, LAST_OUTPUT[])
+        @test wasm_run(c, "ct_after_trap", 1.5; rettype=Tuple{Float64,Float64}, cmodule=CTEST_JS[]) == expected
+        @test wasm_run(c, "ct_trap_midway", 1; rettype=Int, cmodule=CTEST_JS[])[1] === :trap
+        @test wasm_run(c, "ct_after_trap", -0.25; rettype=Tuple{Float64,Float64}, cmodule=CTEST_JS[]) == ct_after_trap(-0.25)
         @test ct_ref_fields(2.0) == 1.0
     end
     msg = ct_unsupported(ct_ref_fields, (Float64,))

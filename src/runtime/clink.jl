@@ -6,7 +6,7 @@ The run-time side of calls into the C module a module is linked with (`Config(c_
 pointer into one (a pointer with an owner) is passed to C as the address of a copy of its
 owner, made for the call in the space the call allocates (`scratch`: the C stack, or the C
 heap past `stack_limit()` bytes), and copied back into the owner after the call when the owner
-is mutable (`to_c`, `back!`). Every pointer of a call into the same owner shares one copy,
+is mutable (`to_c`, `close_frame`). Every pointer of a call into the same owner shares one copy,
 as natively they point into the same object, and an address C gives back into a copy is a
 pointer into its object again (`from_c`).
 
@@ -154,30 +154,72 @@ mutable struct Copy
     writeback::Bool
 end
 
-# the copies of the calls being made (a call made by a C function's callback nests), and the
-# blocks of the C heap their space took, freed when their call returns
+# the copies of the calls being made, and the blocks of the C heap their space took, freed
+# when their call returns
 const COPIES = Copy[]
 const BLOCKS = UInt64[]
 # the bytes of the C stack the calls being made took
 const STACK_USED = Ref(0)
 
-"""
-    enter() -> frame
+"What a call's frame releases: the C stack pointer, the copies, blocks and stack bytes before it."
+struct Frame
+    sp::UInt64
+    ncopies::Int
+    nblocks::Int
+    used::Int
+end
+# the frames of the calls being made
+const FRAMES = Frame[]
 
-The beginning of a call that needs space: the C stack pointer and what `leave` releases.
 """
-@inline enter() = (stack_save(), length(COPIES), length(BLOCKS), STACK_USED[])
+    open_frame() -> frame
+
+The beginning of a call that makes copies (or needs space): its frame, which `close_frame` (when
+the call returns) or `release_frame` (when a Julia exception leaves it) ends.
+
+No Julia code runs while a call into C is being made (C does not call back into Julia), so a
+frame open now was left by a call that trapped: a trap (a Julia exception where nothing
+catches, or any trap) unwinds through the module without running its handlers, to the host,
+which may call the module again. Its state is discarded (`discard!`) before the frame opens, so
+that no copy of it is reused or written back.
+"""
+@noinline function open_frame()
+    isempty(FRAMES) || discard!()
+    push!(FRAMES, Frame(stack_save(), length(COPIES), length(BLOCKS), STACK_USED[]))
+    return length(FRAMES)
+end
 
 """
-    back!(frame)
+    discard!()
+
+The state the calls that trapped left: their copies dropped, their blocks of the C heap freed,
+their bytes of the C stack no longer counted. The C stack pointer is left where they moved it:
+the module cannot know where the host's own C frames, if any, end (it may have called the
+module from a C function's import), and restoring it is the host's (it may read it before
+calling the module, `stack_save`, and restore it after a trap). Their space on the stack is
+lost until then, the space of one call: at most its arguments by value and `stack_limit()`.
+"""
+@noinline function discard!()
+    for b in BLOCKS
+        free(b)
+    end
+    empty!(BLOCKS)
+    empty!(COPIES)
+    empty!(FRAMES)
+    STACK_USED[] = 0
+    return nothing
+end
+
+"""
+    close_frame(frame)
 
 After the call `frame` began returned: each copy it made of a mutable object written back into
 the object, whichever pointer of the call (an argument, an element of a memory of pointers, or
-none any longer: C may have moved it) points into it. The pointers among the copied values that C
-changed are mapped back (`from_c`), all copies being alive until `leave`.
+none any longer: C may have moved it) points into it, the pointers among the copied values that C
+changed mapped back (`from_c`) while all copies are alive; then the frame released.
 """
-@inline function back!(frame::Tuple{UInt64,Int,Int,Int})
-    for k in frame[2]+1:length(COPIES)
+function close_frame(frame::Int)
+    for k in (@inbounds FRAMES[frame]).ncopies+1:length(COPIES)
         r = @inbounds COPIES[k]
         r.writeback || continue
         if r.kind === :elements
@@ -188,24 +230,26 @@ changed are mapped back (`from_c`), all copies being alive until `leave`.
             copy_bytes!(r.owner, r.c, Ptr{UInt8}(r.base), r.n, true)
         end
     end
+    release_frame(frame)
     return nothing
 end
 
 """
-    leave(frame)
+    release_frame(frame)
 
 The end of the call `frame` began (it returned or threw): its copies dropped, its blocks of
 the C heap freed, the C stack pointer restored.
 """
-@inline function leave(frame::Tuple{UInt64,Int,Int,Int})
-    sp, ncopies, nblocks, used = frame
-    for k in nblocks+1:length(BLOCKS)
+function release_frame(frame::Int)
+    f = @inbounds FRAMES[frame]
+    for k in f.nblocks+1:length(BLOCKS)
         free(@inbounds BLOCKS[k])
     end
-    resize!(BLOCKS, nblocks)
-    resize!(COPIES, ncopies)
-    STACK_USED[] = used
-    stack_restore(sp)
+    resize!(BLOCKS, f.nblocks)
+    resize!(COPIES, f.ncopies)
+    STACK_USED[] = f.used
+    stack_restore(f.sp)
+    resize!(FRAMES, frame - 1)
     return nothing
 end
 
@@ -341,7 +385,7 @@ function elements_to_c(@nospecialize(o), @nospecialize(b), ::Type{T}) where {T}
     return nothing
 end
 
-"The copy `r` of `o`, of the type `T` (`elements_to_c`), written back (`back!`, `load_value`)."
+"The copy `r` of `o`, of the type `T` (`elements_to_c`), written back (`close_frame`, `load_value`)."
 function elements_from_c(@nospecialize(o), @nospecialize(r), ::Type{T}) where {T}
     o, r = o::T, r::Copy
     s = Base.aligned_sizeof(eltype(T))
@@ -365,7 +409,7 @@ function fields_to_c(@nospecialize(o), @nospecialize(b), ::Type{T}) where {T}
     return nothing
 end
 
-"The copy `r` of `o`, of the type `T` (`fields_to_c`), written back (`back!`, `load_fields`)."
+"The copy `r` of `o`, of the type `T` (`fields_to_c`), written back (`close_frame`, `load_fields`)."
 fields_from_c(@nospecialize(o), @nospecialize(r), ::Type{T}) where {T} = load_fields((r::Copy).c, o::T)
 
 # copy the `n` bytes of the owner `o` from its base pointer `p` to the C module's memory at `c`,

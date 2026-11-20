@@ -777,8 +777,17 @@ C owns.
   64 KiB), and the C heap's beyond (`malloc`, `free`). It is released when the call returns,
   and when a Julia exception leaves it (a `try_table` catching every exception releases it and
   throws the exception on): an error of a copy, or later of a C function's callback. A trap
-  (in a module where nothing catches, a Julia exception is one) leaves the C stack pointer
-  where it was moved: the next calls' space is below it.
+  (in a module where nothing catches, a Julia exception is one) unwinds to the host without
+  running any handler: the call's copies, its blocks of the C heap and its count of the stack's
+  bytes are left behind. No Julia code runs while a call into C is made, so the next call that
+  opens a frame finds them stale and discards them first (`Runtime.CLink.open_frame`): the
+  blocks are freed and no copy is reused or written back, so what a later call passes and gets
+  back is right. The C stack pointer is not restored: the module cannot know where the host's
+  own C frames end (it may call the module from a C function's import), so it stays where the
+  aborted call moved it, the space of that call lost (at most its arguments by value and
+  `stack_limit`), until the host restores it (reading it before calling the module, restoring it
+  after a trap). Copies already written back are not undone (none is: a trap after the call
+  returned, during the write-back, leaves the objects partly written back).
 - **Measured** (`test/clinkage/benchmark.jl`, Node.js 24, aarch64 macOS): a scalar C call in a
   loop runs at about native speed (1.1×); a call passing a `Vector{Float64}` of 10^5 elements,
   copied to C memory and back, about 2.7× native's; stores and loads through a pointer into C
