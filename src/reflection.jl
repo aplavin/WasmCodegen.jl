@@ -558,14 +558,12 @@ const BY_TYPE_CASES = IdDict{Any,Function}(
     Runtime.Tasks.wait_as => (world, @nospecialize(T)) ->
         !(T <: Task) && !(T <: Base.UnwrapTaskFailedException) && hasmethod(Base.wait, Tuple{T}; world),
     Runtime.showerror_as => (world, @nospecialize(T)) -> T <: Exception && trim_safe_showerror(T, world),
-    # the copies for a call into a C module of the memories and `Ref`s of pointers, or of values
-    # holding pointers (`Runtime.CLink`), element by element, and back
-    Runtime.CLink.pointers_to_c => (world, @nospecialize(T)) -> Runtime.CLink.holds_pointers(T),
-    Runtime.CLink.pointers_from_c => (world, @nospecialize(T)) -> Runtime.CLink.holds_pointers(T),
-    Runtime.CLink.values_to_c => (world, @nospecialize(T)) -> Runtime.CLink.holds_values(T),
-    Runtime.CLink.values_from_c => (world, @nospecialize(T)) -> Runtime.CLink.holds_values(T),
-    Runtime.CLink.fields_to_c => (world, @nospecialize(T)) -> Runtime.CLink.holds_fields(T),
-    Runtime.CLink.fields_from_c => (world, @nospecialize(T)) -> Runtime.CLink.holds_fields(T))
+    # the copies for a call into a C module of the memories of values holding pointers, and of
+    # the mutable objects whose fields hold pointers (`Runtime.CLink`), value by value, and back
+    Runtime.CLink.elements_to_c => (world, @nospecialize(T)) -> c_elements_owner(T),
+    Runtime.CLink.elements_from_c => (world, @nospecialize(T)) -> c_elements_owner(T),
+    Runtime.CLink.fields_to_c => (world, @nospecialize(T)) -> c_fields_owner(T),
+    Runtime.CLink.fields_from_c => (world, @nospecialize(T)) -> c_fields_owner(T))
 
 # whether `showerror(::IOBuffer, ::T)` is trim-safe in `world` (once per type, for the world
 # last asked about: the answers of another world are dropped)

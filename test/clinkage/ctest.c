@@ -212,6 +212,28 @@ EXPORT double ct_big_sum(ct_big b) {
 /* a struct by value and a pointer to one, written */
 EXPORT void ct_vec2_store(ct_vec2 v, ct_vec2 *out) { out->x = v.y; out->y = v.x; }
 
+/* a struct with pointers to arrays, as ImPlot's ImPlotSpec: by value, through a pointer, in an
+ * array, and returned (by sret) pointing into an argument */
+typedef struct { float scale, offset; const float *xs; int n; double *ys; } ct_spec;    /* 32 bytes */
+EXPORT double ct_spec_sum(ct_spec s) {
+    double t = 0;
+    for (int i = 0; i < s.n; i++) {
+        t += s.xs[i] * s.scale + s.offset;
+        if (s.ys) s.ys[i] = t;
+    }
+    return t;
+}
+EXPORT void ct_spec_advance(ct_spec *s) { ct_spec_sum(*s); s->xs += 1; s->n -= 1; }
+EXPORT ct_spec ct_spec_tail(ct_spec s, int k) { s.xs += k; s.n -= k; return s; }
+EXPORT double ct_specs_sum(ct_spec *ss, int m) {
+    double t = 0;
+    for (int i = 0; i < m; i++) { t += ct_spec_sum(ss[i]) * (i + 1); ss[i].xs += i; ss[i].n -= i; }
+    return t;
+}
+/* a struct holding one pointer: passed as the pointer */
+typedef struct { double *p; } ct_ptrbox;
+EXPORT ct_ptrbox ct_ptrbox_next(ct_ptrbox b) { b.p[0] += 1; b.p += 1; return b; }
+
 /* C's own data, read and written by Julia through pointers: an IO-like struct (as ImGuiIO) */
 typedef struct {
     int32_t frame;      /* 0 */

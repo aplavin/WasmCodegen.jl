@@ -59,6 +59,20 @@ copy_elements(@nospecialize(o), off::Int, c::UInt64, n::Int, back::Bool) =
     ccall((:copy_elements, LIBRARY), Bool, (Any, Int, UInt64, Int, Bool), o, off, c, n, back)
 
 """
+    store_value(c, v)
+
+The isbits value `v` at `c` in the C module's memory, as C lays it out, each pointer in it as the
+address `to_c` gives it.
+"""
+store_value(c::UInt64, v) = ccall((:store_value, LIBRARY), Cvoid, (UInt64, Any), c, v)
+"""
+    load_value(c, old) -> value
+
+The isbits value of `old`'s type at `c` in the C module's memory (`store_value`), each pointer in
+it as `back_pointer` gives it: as it was in `old`, owner included, if C did not change it.
+"""
+@generated load_value(c::UInt64, old) = :(ccall((:load_value, LIBRARY), $old, (UInt64, Any), c, old))
+"""
     store_fields(c, o)
 
 The isbits fields of the mutable object `o` at `c` in the C module's memory, as C lays them
@@ -104,10 +118,6 @@ const OWNED_STORE = string(
     "a pointer into a Julia object stored in the C module's memory: the C module cannot address ",
     "Julia objects (pass the pointer as an argument of a ccall, which passes a copy of the object, ",
     "or keep the data in C memory, Libc.malloc)")
-const OWNED_FIELD = string(
-    "a pointer into a Julia object in a struct passed by value to a C function: such a pointer ",
-    "cannot be passed (a pointer argument is passed as the address of a copy of its object, but a ",
-    "field says nothing of the object's size or lifetime; keep its data in C memory, Libc.malloc)")
 const NOT_ADDRESSABLE = string(
     "a pointer into a Julia object whose bytes are not laid out as natively (a memory of ",
     "references or of elements holding references, a mutable object with fields that are not ",
@@ -115,7 +125,6 @@ const NOT_ADDRESSABLE = string(
 const REALLOC_OWNED = "Libc.realloc of a pointer into a Julia object, not a block of the C module's heap"
 
 @noinline throw_owned_store() = c_error(OWNED_STORE)
-@noinline throw_owned_field() = c_error(OWNED_FIELD)
 @noinline throw_not_addressable() = c_error(NOT_ADDRESSABLE)
 @noinline throw_realloc_owned() = c_error(REALLOC_OWNED)
 @noinline function throw_c_oom(n::UInt64)
@@ -131,10 +140,10 @@ end
 The copy of the object `owner` at `c` in the C module's memory, `n` bytes, for the call being
 made; `base` is the pointer to the owner's first byte (its address and the owner), from which
 an address in the copy is mapped back to a pointer into the owner (`from_c`). `kind`: `:bytes`
-(its bytes), `:pointers` (a memory or `Ref` of pointers: the address standing for each pointer),
-`:values` (a memory or `Ref` of isbits values holding pointers, stored as C stores them) or
-`:fields` (a mutable object of isbits fields holding pointers: its fields, each pointer as a
-pointer argument is passed). Written back after the call if `writeback` (a mutable owner).
+(its bytes), `:elements` (a memory of isbits values holding pointers: its elements as C holds
+them, each pointer in them as a pointer argument is passed) or `:fields` (a mutable object of
+isbits fields holding pointers, a `Ref` of such values among them: its fields so). Written back
+after the call if `writeback` (a mutable owner).
 """
 mutable struct Copy
     owner::Any
@@ -171,10 +180,8 @@ changed are mapped back (`from_c`), all copies being alive until `leave`.
     for k in frame[2]+1:length(COPIES)
         r = @inbounds COPIES[k]
         r.writeback || continue
-        if r.kind === :pointers
-            Runtime.by_type(pointers_from_c, r.owner, r)
-        elseif r.kind === :values
-            Runtime.by_type(values_from_c, r.owner, r)
+        if r.kind === :elements
+            Runtime.by_type(elements_from_c, r.owner, r)
         elseif r.kind === :fields
             Runtime.by_type(fields_from_c, r.owner, r)
         else
@@ -223,29 +230,6 @@ function scratch(n::Int, align::Int)
 end
 
 ## pointers into Julia objects, passed to C
-
-is_pointer_type(@nospecialize(T)) = T <: Ptr || T === Cstring || T === Cwstring
-
-# whether values of the isbits type `T` hold pointers
-has_pointers(@nospecialize(T)) =
-    is_pointer_type(T) || (isstructtype(T) && any(has_pointers, fieldtypes(T)))
-
-"""
-Whether the objects of type `T` hold elements of type `E` (the memories of `E`, the `Ref`s of
-it) for which `holds(E)`: the owners whose elements are copied one by one, as the values they
-are (`pointers_to_c`, `values_to_c`: the cases of `by_type` for them).
-"""
-holds(holds::F, @nospecialize(T)) where {F} =
-    T isa DataType && (T <: Memory || T <: Base.RefValue) && isconcretetype(T) && holds(eltype(T))
-holds_pointers(@nospecialize(T)) = holds(is_pointer_type, T)
-holds_values(@nospecialize(T)) = holds(E -> isbitstype(E) && has_pointers(E) && !is_pointer_type(E), T)
-"""
-Whether the objects of type `T` are mutable objects (not memories or `Ref`s) whose fields are
-isbits values, some holding pointers: copied field by field (`fields_to_c`).
-"""
-holds_fields(@nospecialize(T)) =
-    T isa DataType && isconcretetype(T) && ismutabletype(T) && !(T <: Memory) && !(T <: Base.RefValue) &&
-    fieldcount(T) > 0 && all(isbitstype, fieldtypes(T)) && any(has_pointers, fieldtypes(T))
 
 # the copy of the call whose owner is `o`, or 0
 function find_copy(@nospecialize(o))
@@ -320,15 +304,15 @@ C having left the address `a` there: `old` itself, owner included, if C did not 
 back_pointer(a::UInt64, old::Ptr{Cvoid}) = a == c_address(old) ? old : from_c(a)
 
 # the copy of the owner `o` of a pointer whose base pointer is `base`: pushed to `COPIES`, its
-# index. Of a memory or `Ref` of pointers (`Vector{String}` as `Ptr{Cstring}`, a `Ref{Ptr{T}}`),
-# each passed as a pointer argument is; of a memory or `Ref` of values holding pointers, each
-# stored as in the C module's memory (a pointer into an object among them an error); of others,
-# the bytes (of a string or symbol, and the NUL after them)
+# index. Of a memory of values holding pointers (`Vector{String}` as `Ptr{Cstring}`, which Base
+# makes a vector of pointers, an array of structs with pointer fields) and of a mutable object
+# whose fields hold pointers (a `Ref{Ptr{T}}` out-parameter, a `Ref` of such a struct), their
+# values with each pointer passed as a pointer argument is (`elements_to_c`, `fields_to_c`); of
+# others, the bytes (of a string or symbol, and the NUL after them)
 function copy_owner!(@nospecialize(o), base::Ptr{Cvoid})
     # (the copy is pushed first, those of the objects its pointers point into after it)
     k = length(COPIES) + 1
-    (Runtime.by_type(pointers_to_c, o, base) || Runtime.by_type(values_to_c, o, base) ||
-     Runtime.by_type(fields_to_c, o, base)) && return k
+    (Runtime.by_type(elements_to_c, o, base) || Runtime.by_type(fields_to_c, o, base)) && return k
     n = owner_nbytes(o)
     n < 0 && throw_not_addressable()
     immutable = o isa String || o isa Symbol
@@ -339,34 +323,31 @@ function copy_owner!(@nospecialize(o), base::Ptr{Cvoid})
     return length(COPIES)
 end
 
-# the elements of `o`, a memory or a `Ref`
-nelements(o) = o isa Memory ? length(o) : 1
-element(o, i::Int) = o isa Memory ? (@inbounds o[i]) : o[]
-set_element!(o, i::Int, v) = o isa Memory ? (@inbounds o[i] = v) : (o[] = v)
-
-"The copy of `o`, of the type `T` holding pointers, whose base address is `b` (`copy_owner!`)."
-function pointers_to_c(@nospecialize(o), @nospecialize(b), ::Type{T}) where {T}
+"""
+The copy of `o`, a memory of type `T` whose elements are isbits values holding pointers
+(`c_elements_owner`), whose base pointer is `b` (`copy_owner!`): its elements as C holds them,
+each pointer in them as a pointer argument is passed (`store_value`).
+"""
+function elements_to_c(@nospecialize(o), @nospecialize(b), ::Type{T}) where {T}
     o = o::T
-    n = nelements(o)
-    c = scratch(8n, 8)
+    s = Base.aligned_sizeof(eltype(T))
+    n = length(o)
+    c = scratch(n * s, Base.datatype_alignment(eltype(T)))
     # (the copy first: a pointer among them to the object itself is to the copy)
-    push!(COPIES, Copy(o, b::Ptr{Cvoid}, c, 8n, :pointers, true))
+    push!(COPIES, Copy(o, b::Ptr{Cvoid}, c, n * s, :elements, true))
     for i in 1:n
-        unsafe_store!(Ptr{UInt64}(c), to_c(Core.bitcast(Ptr{Cvoid}, element(o, i))), i)
+        store_value(c + UInt64((i - 1) * s), @inbounds o[i])
     end
     return nothing
 end
 
-"The copy of `o`, of the type `T` holding values with pointers, whose base address is `b` (`copy_owner!`)."
-function values_to_c(@nospecialize(o), @nospecialize(b), ::Type{T}) where {T}
-    o = o::T
-    E = eltype(T)
-    n = nelements(o)
-    c = scratch(n * Base.aligned_sizeof(E), Base.datatype_alignment(E))
-    for i in 1:n
-        unsafe_store!(Ptr{E}(c), element(o, i), i)
+"The copy `r` of `o`, of the type `T` (`elements_to_c`), written back (`back!`, `load_value`)."
+function elements_from_c(@nospecialize(o), @nospecialize(r), ::Type{T}) where {T}
+    o, r = o::T, r::Copy
+    s = Base.aligned_sizeof(eltype(T))
+    for i in 1:length(o)
+        @inbounds o[i] = load_value(r.c + UInt64((i - 1) * s), @inbounds o[i])
     end
-    push!(COPIES, Copy(o, b::Ptr{Cvoid}, c, n * Base.aligned_sizeof(E), :values, true))
     return nothing
 end
 
@@ -409,30 +390,6 @@ function copy_bytes!(@nospecialize(o), c::UInt64, p::Ptr{UInt8}, n::Int, back::B
             unsafe_store!(Ptr{UInt8}(c + i), unsafe_load(p + i))
         end
         i += 1
-    end
-    return nothing
-end
-
-"""
-The copy `r` of `o`, of the type `T` holding pointers, written back (`back!`): a pointer C left
-as it was stays the pointer it was, owner included; one it changed is the pointer its new
-address stands for (`from_c`).
-"""
-function pointers_from_c(@nospecialize(o), @nospecialize(r), ::Type{T}) where {T}
-    o, r = o::T, r::Copy
-    for i in 1:nelements(o)
-        q = Core.bitcast(Ptr{Cvoid}, element(o, i))
-        a = unsafe_load(Ptr{UInt64}(r.c), i)
-        a == c_address(q) || set_element!(o, i, Core.bitcast(eltype(T), from_c(a)))
-    end
-    return nothing
-end
-
-"The copy `r` of `o`, of the type `T` holding values with pointers, written back (`back!`)."
-function values_from_c(@nospecialize(o), @nospecialize(r), ::Type{T}) where {T}
-    o, r = o::T, r::Copy
-    for i in 1:nelements(o)
-        set_element!(o, i, unsafe_load(Ptr{eltype(T)}(r.c), i))
     end
     return nothing
 end

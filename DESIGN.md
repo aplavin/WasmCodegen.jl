@@ -743,30 +743,33 @@ C owns.
   default promotion: as Julia's `ccall`, that is the caller's), as one more parameter. Types
   that are none of these (not isbits, `Any`, `Float16`, 128-bit integers, a struct by value as
   a variadic argument) are unsupported constructs naming the call.
-- **Pointers into Julia objects passed to C** (`runtime/clink.jl`). An argument pointing into a
-  Julia object (with an owner) is passed as the address of a copy of its owner made for the
-  call, and the copy is written back after the call into a mutable owner (a memory, a `Ref`, a
-  mutable struct; never a string or symbol, whose copy ends with a NUL). The whole owner is
-  copied, whichever element the pointer points to, so that every pointer of a call into one
-  object shares one copy (C may compare them, or read before the pointer, as natively in one
-  object). The elements of a memory or `Ref` of pointers (`Vector{String}` as `Ptr{Cstring}`,
-  which Base converts to a vector of pointers, or a `Ref{Ptr{T}}` out-parameter) are passed
-  each as a pointer argument is, recursively, and after the call a pointer C left as it was is
-  the pointer it was, owner included; those of a memory of values holding pointers are stored
-  as in C memory. The pointer fields of a mutable struct passed by pointer (`Ref` of it,
-  `pointer_from_objref`) are passed as pointer arguments are, and come back the same way. A
-  mutable object with fields that are not isbits (references, inline unions) cannot be given to
-  C as a copy: an unsupported construct where the pointer's object is known when compiling, else
-  an error when the call is made. An address C gives back (a pointer result, a pointer it wrote: an
-  out-parameter, an element of an array of pointers it permuted) that is in a copy of the call
-  is mapped, before the copies are dropped, to the pointer into that copy's object at the same
-  offset (or one past its end); any other address is a C address. Every copy of a mutable
-  object is written back after the call, whichever pointer, if any, still points into it. A pointer into a Julia object in a struct passed
-  by value is an error (a field says nothing of the object to copy, its size or its lifetime).
-  The copy costs O(n) per call in the size of the object: data a program passes to C at every
-  call is better kept in C memory (`Libc.malloc`), where it is passed as its address, without
-  a copy. C may not keep a pointer to a copy after the call (natively it may keep one into the
-  object, while it lives).
+- **Pointers into Julia objects passed to C** (`runtime/clink.jl`). A pointer into a Julia
+  object (with an owner) is passed as the address of a copy of its owner made for the call, and
+  the copy is written back after the call into a mutable owner (a memory, a `Ref`, a mutable
+  struct; never a string or symbol, whose copy ends with a NUL). This holds wherever C is given
+  the pointer: an argument, a variadic argument, a field of a struct by value (ImPlot's
+  `ImPlotSpec` pointing at Julia vectors), an element of a memory or a field of a mutable object
+  that is itself copied. The owner gives the size of the copy and the call its lifetime. The
+  whole owner is copied, whichever element the pointer points to, so that every pointer of a
+  call into one object shares one copy (C may compare them, or read before the pointer, as
+  natively in one object). The values of a memory of isbits values holding pointers
+  (`Vector{String}` as `Ptr{Cstring}`, which Base converts to a vector of pointers; an array of
+  structs with pointer fields) and the fields of a mutable object holding pointers (a
+  `Ref{Ptr{T}}` out-parameter, a `Ref` of such a struct, a mutable struct by
+  `pointer_from_objref`) are copied as C lays them out, each pointer in them passed as above,
+  recursively. A mutable object with fields that are not isbits (references, inline unions)
+  cannot be given to C as a copy: an unsupported construct where the pointer's object is known
+  when compiling, else an error when the call is made.
+  After the call, every copy of a mutable object is written back, whichever pointer, if any,
+  still points into it; a pointer in a copied value that C left as it was is the pointer it
+  was, owner included. An address C gives back (a result, the pointer fields of a result by
+  sret, a pointer it wrote: an out-parameter, a field, an element of an array of pointers it
+  permuted) that is in a copy of the call is mapped, before the copies are dropped, to the
+  pointer into that copy's object at the same offset (or one past its end); any other address
+  is a C address. The copy costs O(n) per call in the size of the object: data a program passes
+  to C at every call is better kept in C memory (`Libc.malloc`), where it is passed as its
+  address, without a copy. C may not keep a pointer to a copy after the call (natively it may
+  keep one into the object, while it lives).
 - **The space of a call** (copies, structs by value and results, the variadic buffer) is the C
   stack's, allocated by the C module's exports (`CLinkage(stack_save, stack_alloc,
   stack_restore)`, emscripten's `emscripten_stack_get_current`, `_emscripten_stack_alloc`,

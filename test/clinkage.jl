@@ -699,10 +699,41 @@ function ct_named(i::Int32)
     n = ccall((:ct_named_len, libctest), Csize_t, (CtNamedJ,), s)
     return (sdigest(unsafe_string(s.name)), s.n, n)
 end
-# a pointer into a Julia object in a struct by value: an error
+# a pointer into a Julia object in a struct by value: passed as a pointer argument is
 function ct_named_owned(n::Int)
     s = "julia"
     GC.@preserve s ccall((:ct_named_len, libctest), Csize_t, (CtNamedJ,), CtNamedJ(pointer(s), Cint(n)))
+end
+# ImPlot's way: a struct whose pointer fields point at Julia vectors, by value (C writes through
+# one), by `Ref` (C moves one), in an array, and returned by sret pointing into an argument
+struct CtSpec
+    scale::Float32
+    offset::Float32
+    xs::Ptr{Float32}
+    n::Cint
+    ys::Ptr{Float64}
+end
+struct CtPtrBox
+    p::Ptr{Float64}
+end
+function ct_specs(n::Int)
+    xs = Float32[i / 2 for i in 1:n]
+    ys = zeros(n)
+    GC.@preserve xs ys begin
+        s = CtSpec(2, 0.5, pointer(xs), n, pointer(ys))
+        a = ccall((:ct_spec_sum, libctest), Float64, (CtSpec,), s)
+        r = Ref(s)
+        ccall((:ct_spec_advance, libctest), Cvoid, (Ref{CtSpec},), r)
+        moved = (Int(r[].xs - pointer(xs)), unsafe_load(r[].xs), r[].n, r[].ys == pointer(ys), unsafe_load(r[].ys, 2))
+        t = ccall((:ct_spec_tail, libctest), CtSpec, (CtSpec, Cint), s, Cint(2))
+        tail = (Int(t.xs - pointer(xs)), unsafe_load(t.xs), t.n, t.ys == pointer(ys))
+        arr = [CtSpec(1, i, pointer(xs, i), n - i + 1, i == 2 ? C_NULL : pointer(ys, i)) for i in 1:3]
+        tot = ccall((:ct_specs_sum, libctest), Float64, (Ptr{CtSpec}, Cint), arr, 3)
+        arrmoved = [(Int(x.xs - pointer(xs)), unsafe_load(x.xs), x.n) for x in arr]
+        b = ccall((:ct_ptrbox_next, libctest), CtPtrBox, (CtPtrBox,), CtPtrBox(pointer(ys, 2)))
+        boxed = (Int(b.p - pointer(ys)), unsafe_load(b.p))
+    end
+    return (a, moved, tail, tot, arrmoved[1], arrmoved[2], arrmoved[3], boxed, vdigest(ys))
 end
 # ImGui's way: a struct of C's, by a pointer to it, whose fields hold structs by value
 function ct_io_struct()
@@ -721,9 +752,8 @@ end
         @test crun(ct_empty_arg, Cint(4)) === Cint(42)
         @ctest ct_io_struct()
         @ctest ct_io_reset()
-        @test ct_named_owned(2) == 10
-        @test crun(ct_named_owned, 2)[1] === :trap
-        @test occursin(WasmCodegen.Runtime.CLink.OWNED_FIELD, LAST_OUTPUT[])
+        @ctest ct_named_owned(2)
+        @ctest ct_specs(6)
         # (the Wasm types the C ABI gives: ImVec2 by the address of a copy, a result by sret, a
         # struct of one float as a float, an empty struct dropped)
         c = ccompile(ct_structs, (Float32, Float64))

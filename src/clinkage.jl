@@ -183,9 +183,11 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
     end
     variadic = nreq > 0
     fixed = variadic ? (1:nreq) : eachindex(ATs)
-    # pointers that may point into Julia objects: copied for the call, and back after it
+    # pointers that may point into Julia objects: copied for the call, and back after it (the
+    # arguments, and the pointers in structs by value)
     owned = [k for k in eachindex(ATs) if aabis[k].kind === :pointer && !ownerless(vals[k])]
-    space = rabi.kind === :indirect || variadic || !isempty(owned) || any(a -> a.kind === :indirect, aabis)
+    copies = !isempty(owned) || any(k -> aabis[k].kind !== :pointer && maybe_owned(vals[k], ATs[k]), fixed)
+    space = rabi.kind === :indirect || variadic || copies || any(a -> a.kind === :indirect, aabis)
     guarded = space && cgm.exceptions !== :none
     frame = space ? call_runtime!(fc, Runtime.CLink.enter, CGVal[]) : nothing
     if guarded
@@ -207,15 +209,14 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
         a, v, T = aabis[k], vals[k], ATs[k]
         if a.kind === :scalar
             t = c_scalar_wtype(a.type)
-            push_c_scalar!(fc, v, T, a.type)
+            push_c_scalar!(fc, v, T, a.type, CallFrame(nothing))
             l = new_local!(fc, t); emit!(fc.b, :local_set, l)
             push!(params, t); push!(pushes, l)
         elseif a.kind === :pointer
             push!(params, I64); push!(pushes, get(addrs, k, v.leaves[1]))
         elseif a.kind === :indirect
             c = c_scratch!(fc, sizeof(T), Base.datatype_alignment(T))
-            c_store!(fc, c_pointer(fc, c, T), convert_repr(fc, v, T), const_value(fc, 1);
-                     owned=Runtime.CLink.throw_owned_field)
+            c_store!(fc, c_pointer(fc, c, T), convert_repr(fc, v, T), const_value(fc, 1); owned=CallFrame(nothing))
             push!(params, I64); push!(pushes, c)
         end
     end
@@ -232,16 +233,16 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
         a = new_local!(fc, I64); emit!(fc.b, :local_set, a)
         CGVal(RT, Inline, LeafVal[a, Inst(:ref_null, cgm.types.jlvalue)])
     elseif rabi.kind === :indirect
-        c_load!(fc, c_pointer(fc, pushes[1]::Int, RT), const_value(fc, 1), RT)
+        # (a pointer C returns into a copy is into its object, as below)
+        c_load!(fc, c_pointer(fc, pushes[1]::Int, RT), const_value(fc, 1), RT; frame=copies ? CallFrame(nothing) : nothing)
     else
         RT === Cvoid || RT === Nothing ? ghost(Nothing, nothing) : ghost(RT, something(ghost_value(RT)))
     end
-    if !isempty(owned)
+    if copies
         # (a pointer C returns into a copy is into its object; the copies of mutable objects
         # written back, while all are alive)
         if rabi.kind === :pointer || (rabi.kind === :scalar && is_ptr_type(rabi.type))
-            p = call_runtime!(fc, Runtime.CLink.from_c, CGVal[CGVal(UInt64, Inline, LeafVal[res.leaves[1]])])
-            res = CGVal(RT, Inline, convert_repr(fc, p, Ptr{Cvoid}).leaves)
+            res = CGVal(RT, Inline, c_back_pointer!(fc, res.leaves[1], CallFrame(nothing), nothing).leaves)
         end
         call_runtime!(fc, Runtime.CLink.back!, CGVal[frame])
     end
@@ -319,14 +320,44 @@ function c_back_pointer!(fc::FnCtx, a::LeafVal, frame::CallFrame, old)
     return convert_repr(fc, r, Ptr{Cvoid})
 end
 
+"""
+Whether the value `v` of the declared isbits type `T` (an argument by value) may hold a pointer
+into a Julia object: a pointer in it whose owner is not known to be null here.
+"""
+function maybe_owned(v::CGVal, @nospecialize(T))
+    has_pointers(T) || return false
+    (v.typ === T && v.kind === Inline) || return true
+    bl = bit_leaves(T)
+    length(bl) == length(v.leaves) || return true
+    return any((((P, _), l),) -> P === :owner && !(l isa Inst && l.op === :ref_null), zip(bl, v.leaves))
+end
+
+"Whether values of the isbits type `T` hold pointers."
+has_pointers(@nospecialize(T)) = is_ptr_type(T) || (isstructtype(T) && any(has_pointers, fieldtypes(T)))
+
+"""
+Whether the objects of type `T` are memories of isbits values holding pointers, copied for C
+value by value (`Runtime.CLink.elements_to_c`: a case of `by_type`).
+"""
+c_elements_owner(@nospecialize(T)) =
+    T isa DataType && T <: Memory && isconcretetype(T) && isbitstype(eltype(T)) && has_pointers(eltype(T))
+
+"""
+Whether the objects of type `T` are mutable objects (a `Ref` among them) whose fields are isbits
+values, some holding pointers, copied for C field by field (`Runtime.CLink.fields_to_c`: a case
+of `by_type`).
+"""
+c_fields_owner(@nospecialize(T)) =
+    T isa DataType && isconcretetype(T) && ismutabletype(T) && !(T <: Memory) && fieldcount(T) > 0 &&
+    all(isbitstype, fieldtypes(T)) && any(has_pointers, fieldtypes(T))
+
 # push the scalar `P` the argument `v` of the declared type `T` is or holds, as the C ABI
-# passes it: a small integer extended by its signedness; a pointer (in a struct by value) by
-# its address, which may not be into a Julia object
-function push_c_scalar!(fc::FnCtx, v::CGVal, @nospecialize(T), @nospecialize(P))
+# passes it: a small integer extended by its signedness; a pointer (a struct holding one, by
+# value) by the address standing for it (`c_pointer_address!`) in the call's frame `frame`
+function push_c_scalar!(fc::FnCtx, v::CGVal, @nospecialize(T), @nospecialize(P), frame::CallFrame)
     x = convert_repr(fc, v, T)
     if is_ptr_type(P)
-        check_ownerless!(fc, ptr_owner(x), Runtime.CLink.throw_owned_field)
-        push_leaf!(fc, x.leaves[1])
+        push_leaf!(fc, c_pointer_address!(fc, CGVal(Ptr{Cvoid}, Inline, x.leaves[1:2]), frame))
         return
     end
     push_leaf!(fc, only(x.leaves))
@@ -389,7 +420,7 @@ function c_varargs!(fc::FnCtx, vals::Vector{CGVal}, ATs::Vector{Any}, abis::Vect
             emit!(fc.b, :i64_store, 3, offs[j])
         else
             P = a.type
-            push_c_scalar!(fc, vals[k], ATs[k], P)
+            push_c_scalar!(fc, vals[k], ATs[k], P, CallFrame(nothing))
             n = is_ptr_type(P) ? 8 : sizeof(P)
             emit!(fc.b, c_access_op(c_scalar_wtype(P), n, true), trailing_zeros(n), offs[j])
         end
@@ -467,6 +498,16 @@ function emit_clink_primitive!(fc::FnCtx, @nospecialize(name), args::Vector{Any}
         c_memory!(cgm)
         foreach(v -> push_val!(fc, v), vals)
         emit!(fc.b, name === :memmove ? :memory_copy : :memory_fill, (name === :memmove ? (0, 0) : (0,))...)
+        return ghost(Nothing, nothing)
+    elseif name === :store_value || name === :load_value
+        # (in a copy of the call's frame: `Runtime.CLink.elements_to_c`, `elements_from_c`)
+        v = vals[2]
+        E = v.typ
+        isbitstype(E) || unsupported("a value of type ", E, " in the C module's memory")
+        c = new_local!(fc, I64)
+        push_val!(fc, vals[1]); emit!(fc.b, :local_set, c)
+        name === :load_value && return c_load!(fc, c_pointer(fc, c, E), const_value(fc, 1), E; frame=CallFrame(nothing), old=v)
+        c_store!(fc, c_pointer(fc, c, E), v, const_value(fc, 1); owned=CallFrame(nothing))
         return ghost(Nothing, nothing)
     elseif name === :store_fields || name === :load_fields
         # (in a copy of the call's frame: `Runtime.CLink.fields_to_c`, `fields_from_c`)
