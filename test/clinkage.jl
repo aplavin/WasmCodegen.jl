@@ -652,3 +652,30 @@ end
     end
 end
 
+## varargs: the variadic arguments in a buffer, at their alignments (D4)
+
+function ct_varargs(a::Cint, b::Float64)
+    s0 = @ccall libctest.ct_vsum(0::Cint; )::Cint
+    s3 = @ccall libctest.ct_vsum(3::Cint; a::Cint, (a + Cint(1))::Cint, Cint(-7)::Cint)::Cint
+    x = Ref{Cint}(5)
+    m = @ccall libctest.ct_vmix("idslpi"::Cstring; a::Cint, b::Float64, "four"::Cstring, (Int64(1) << 40)::Int64,
+                                x::Ptr{Cint}, Cint(9)::Cint)::Float64
+    buf = zeros(UInt8, 80)
+    n = @ccall libctest.ct_sprintf(buf::Ptr{UInt8}, 80::Csize_t, "%d|%.2f|%s|%c|%lld"::Cstring;
+                                   a::Cint, b::Float64, "str"::Cstring, Cint('Z')::Cint, (Int64(-1) << 35)::Clonglong)::Cint
+    return (s0, s3, m, x[], sdigest(String(buf[1:n])))
+end
+
+@testset "C linkage: varargs" begin
+    if HAS_C_TOOLCHAIN
+        @ctest ct_varargs(Cint(12), 2.5)
+        @ctest ct_varargs(Cint(-1), -1e10)
+        c = ccompile(ct_varargs, (Cint, Float64))
+        imp(name) = only(f for f in c.cgm.mod.funcs if f.imported == ("c", name))
+        @test imp("ct_vsum").params == ValType[I32, I64] && imp("ct_vmix").params == ValType[I64, I64]
+    end
+    # a struct by value as a variadic argument
+    f(v::CtVec2) = @ccall libctest.ct_vsum(1::Cint; v::CtVec2)::Cint
+    msg = ct_unsupported(f, (CtVec2,))
+    @test msg isa String && occursin("the variadic argument of type CtVec2", msg)
+end

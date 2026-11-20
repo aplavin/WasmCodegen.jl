@@ -16,9 +16,9 @@
 #
 # A pointer into a Julia object (with an owner) is passed as the address of a copy of its
 # owner, made for the call (`Runtime.CLink`), and copied back after it into a mutable owner.
-# The space a call needs (copies, structs by value, results) is the C stack's
-# (`CLinkage(stack_save, stack_alloc, stack_restore)`), or the C heap's past `stack_limit` bytes,
-# released when the call returns or throws. (Not yet: variadic calls.)
+# The space a call needs (copies, structs by value, results, variadic arguments) is the C
+# stack's (`CLinkage(stack_save, stack_alloc, stack_restore)`), or the C heap's past
+# `stack_limit` bytes, released when the call returns or throws.
 
 "The library of the primitives `Runtime.CLink` calls (`emit_clink_primitive!`)."
 const CLINK_LIBRARY = Runtime.CLink.LIBRARY
@@ -174,10 +174,11 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
         a.kind === :pointer && !is_ptr_type(v.typ) &&
             unsupported("a ", v.typ, " as the argument ", k, " (declared ", T, ") of a ccall of ", what...)
     end
-    nreq > 0 && unsupported("a variadic ccall (not yet) of ", what...)
+    variadic = nreq > 0
+    fixed = variadic ? (1:nreq) : eachindex(ATs)
     # pointers that may point into Julia objects: copied for the call, and back after it
     owned = [k for k in eachindex(ATs) if aabis[k].kind === :pointer && !ownerless(vals[k])]
-    space = rabi.kind === :indirect || !isempty(owned) || any(a -> a.kind === :indirect, aabis)
+    space = rabi.kind === :indirect || variadic || !isempty(owned) || any(a -> a.kind === :indirect, aabis)
     guarded = space && cgm.exceptions !== :none
     frame = space ? call_runtime!(fc, Runtime.CLink.enter, CGVal[]) : nothing
     if guarded
@@ -195,7 +196,7 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
     for k in owned
         addrs[k] = c_pointer_address!(fc, vals[k])
     end
-    for k in eachindex(ATs)
+    for k in fixed
         a, v, T = aabis[k], vals[k], ATs[k]
         if a.kind === :scalar
             t = c_scalar_wtype(a.type)
@@ -210,6 +211,9 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
                      err=Runtime.CLink.throw_owned_field)
             push!(params, I64); push!(pushes, c)
         end
+    end
+    if variadic
+        push!(params, I64); push!(pushes, c_varargs!(fc, vals, ATs, aabis, nreq, addrs))
     end
     results = rabi.kind === :scalar ? ValType[c_scalar_wtype(rabi.type)] :
               rabi.kind === :pointer ? ValType[I64] : ValType[]
@@ -319,6 +323,38 @@ function check_ownerless!(fc::FnCtx, owner::LeafVal, @nospecialize(err))
     is_unreachable(fc.b) || unreachable!(fc.b)
     end!(fc.b)
     return
+end
+
+"""
+The buffer of the variadic arguments (from `nreq + 1`) of a call: each at its alignment, as
+its declared type says (a pointer as its address: `addrs`, else its own). A local.
+"""
+function c_varargs!(fc::FnCtx, vals::Vector{CGVal}, ATs::Vector{Any}, abis::Vector{CAbi}, nreq::Int,
+                    addrs::Dict{Int,Int})
+    offs = Int[]
+    off = 0
+    for k in nreq+1:length(ATs)
+        s = abis[k].kind === :pointer ? 8 : sizeof(abis[k].type)
+        off = cld(off, s) * s
+        push!(offs, off)
+        off += s
+    end
+    c_memory!(fc.cgm)
+    buf = c_scratch!(fc, off, 16)
+    for (j, k) in enumerate(nreq+1:length(ATs))
+        a = abis[k]
+        emit!(fc.b, :local_get, buf)
+        if a.kind === :pointer
+            push_leaf!(fc, get(addrs, k, vals[k].leaves[1]))
+            emit!(fc.b, :i64_store, 3, offs[j])
+        else
+            P = a.type
+            push_c_scalar!(fc, vals[k], ATs[k], P)
+            n = is_ptr_type(P) ? 8 : sizeof(P)
+            emit!(fc.b, c_access_op(c_scalar_wtype(P), n, true), trailing_zeros(n), offs[j])
+        end
+    end
+    return buf
 end
 
 """
