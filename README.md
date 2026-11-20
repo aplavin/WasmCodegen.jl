@@ -101,6 +101,35 @@ from the import back into the module may overwrite them, and growing the memory 
 existing views, so copy them (`.slice()`) to keep them. `examples/jsbytes` gives a message to a page this way, and compares
 it with reading it by calls of an export.
 
+A program can also call a C library compiled to Wasm, linked with the module at instantiation:
+`Config(c_linkage = CLinkage(libraries = [libfoo]))` makes a `ccall((:name, libfoo), ...)` a
+call of the export `name` of a C module for wasm64 (emscripten's `-m64`), whose memory the
+module imports as its own, as unmodified bindings (CImGui.jl's) call it natively. `libfoo` is
+the library's identity, its value when the module is compiled (a JLL's path). Arguments and
+results follow the C ABI (structs by value, results by sret, varargs); a pointer without owner
+is an address in the C module's memory (`Libc.malloc`, C's results, `unsafe_load` and
+`unsafe_store!` of C's structs), and a pointer into a Julia object (an array, a string, a `Ref`)
+is passed as the address of a copy of the object, written back after the call: O(n) per call,
+so data passed at every call is better kept in C memory. The C module provides its stack and
+allocator exports (`-sEXPORTED_FUNCTIONS=_malloc,_free,_emscripten_stack_get_current,__emscripten_stack_alloc,__emscripten_stack_restore`),
+and its instance's raw exports are the import module `c` (emscripten's `Module.wasmExports`
+wraps some of a memory64 module's, so take them where it instantiates the module, e.g. in its
+`instantiateWasm`):
+
+```js
+import createC from './libfoo.mjs';                  // emcc -m64 -sMODULARIZE -sEXPORT_ES6 ...
+let c;
+await createC({ instantiateWasm(imports, done) {
+  WebAssembly.instantiate(fs.readFileSync('libfoo.wasm'), imports)
+    .then(({ instance }) => { c = instance.exports; done(instance); });
+  return {};
+} });
+const { instance } = await instantiate(fs.readFileSync('f.wasm'), { imports: { c } });
+```
+
+[DESIGN.md](DESIGN.md) §11 describes the model and its limits (one C module, 64-bit, `host =
+:js`; no C callbacks into Julia yet).
+
 WASI file paths use absolute preopen names and a virtual working directory (`PWD`, or the
 first preopen). Preopens must occupy contiguous descriptors starting at 3; the first EBADF
 ends discovery. Resolution uses the longest component-prefix match. `.` and `..` after a

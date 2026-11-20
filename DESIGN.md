@@ -688,6 +688,94 @@ streams), the image (tables, symbols, cycles, identity), exceptions (try/catch/f
 rethrow, the exceptions of Base and of the code generator's checks), strings, Unicode and
 printing found missing by sweeping WasmTarget.jl's catalogue of Base operations, and
 JuliaC.jl's own test programs (reshape, dispatch, reductions, concatenations, printing;
-the untrimmable one must be rejected). The tests run the optimized modules. The examples: `examples/lorenz`
+the untrimmable one must be rejected), and the C linkage of section 11 (`test/clinkage.jl`: the
+same functions calling a C library natively and, compiled, the library built for wasm64 with
+emscripten, with the toolchains of `test/clinkage/shell.nix`; skipped without them). The tests
+run the optimized modules. The examples: `examples/lorenz`
 (OrdinaryDiffEq), `examples/mtk` (a ModelingToolkit model), `examples/juliasyntax` (Julia's
 parser, compared with native JuliaSyntax node for node on Base's sources), each with a page.
+
+## 11. Linking with a C module
+
+`Config(c_linkage = CLinkage(libraries = [...]))` links the module with one C module: a C
+library compiled to Wasm separately, for wasm64 (emscripten's `-m64`, clang's `wasm64`: a
+64-bit memory, memory64, whose pointers, `size_t` and `long` are 8 bytes, so that structs are
+laid out as Julia lays them out on 64-bit platforms). The C module owns the only linear memory:
+the module imports it (`import_module.memory`) instead of defining its own, and imports the C
+functions its `ccall`s name (`clinkage.jl`). This is how unmodified bindings run: CImGui.jl's
+`ccall((:igBegin, libcimgui), ...)`, with `libcimgui` a non-constant global a JLL package's
+`__init__` sets to the library's path, its structs by value (`ImVec2`), its `Ref`s, arrays and
+strings, its variadic `igText`, and its accessors `unsafe_load(Ptr{ImVec2}(io + 8))` of structs
+C owns.
+
+- **Libraries.** A `ccall`'s library is resolved when the module is compiled, to its value in
+  the build process: a constant, or a global variable, constant or not (the image is a
+  snapshot of that process; a JLL's path is the one it has). It is the C module's when equal
+  (as a `String` or a `Symbol`) to one of `libraries`; calls of others are as without a C
+  module. Only `host = :js`: WASI's calls pass data in a memory of the module's own, at
+  offsets of its own, as do the byte arguments of `import_libraries`' imports (an unsupported
+  construct with a C module); none may write the C module's memory.
+- **Pointers without owner are C addresses** (`pointers.jl`). The null owner of a pointer made
+  from an integer (section 5) is the C module's memory, as natively: a load or store through
+  one is the memory's instruction for each primitive leaf (little-endian, as Julia lays out
+  isbits values; a `Ptr` stored as its address, loaded without owner). Where the owner is known
+  to be null where the pointer is compiled (made from an integer, a C function's result,
+  loaded from C memory, or moved from one of these: the owner leaf is the constant null), that
+  is all; where it is known only at run time (an argument), a test of the owner chooses between
+  this and the owner's access. A pointer into a Julia object stored in C memory, as a value or
+  in a struct, cannot mean anything there (C cannot address the object): an error, written to
+  `Core.stderr` too, as natively nothing is thrown and nothing may catch it. `memmove` between
+  two C addresses is `memory.copy`, `memset` of one `memory.fill`, and a copy between C memory
+  and an array whose elements are laid out as natively one loop over the elements. `Libc.malloc`,
+  `calloc`, `realloc` and `free` are the C module's (`free` of a pointer into a Julia object does
+  nothing, as before: the object is the collector's). Without a C module nothing changes: such
+  a pointer cannot be dereferenced. `unsafe_wrap` of a pointer is unsupported: an array cannot
+  share bytes of the linear memory.
+- **Calls** are calls of the import of the C function, one per name (calls declaring
+  signatures of other Wasm types are an error), whose Wasm type the C ABI of wasm64 gives the
+  declared signature (clang's `WebAssemblyABIInfo`, measured in `cimgui-wasm64`): integers of up
+  to 32 bits and `Bool` are `i32`s, extended by their signedness (an enum's integer's), 64-bit
+  ones `i64`s, floats `f32` and `f64`, pointers (`Ptr`, `Ref`, `Cstring`, `Cwstring`) `i64`
+  addresses; an isbits struct or tuple by value is nothing when empty, its scalar when it holds
+  one (through structs of one field), else the address of a copy the caller makes; such a result
+  is written by the callee at an address the caller passes first (sret); a variadic call passes
+  its variadic arguments in a buffer, each at its alignment as its declared type says (no
+  default promotion: as Julia's `ccall`, that is the caller's), as one more parameter. Types
+  that are none of these (not isbits, `Any`, `Float16`, 128-bit integers, a struct by value as
+  a variadic argument) are unsupported constructs naming the call.
+- **Pointers into Julia objects passed to C** (`runtime/clink.jl`). An argument pointing into a
+  Julia object (with an owner) is passed as the address of a copy of its owner made for the
+  call, and the copy is written back after the call into a mutable owner (a memory, a `Ref`, a
+  mutable struct; never a string or symbol, whose copy ends with a NUL). The whole owner is
+  copied, whichever element the pointer points to, so that every pointer of a call into one
+  object shares one copy (C may compare them, or read before the pointer, as natively in one
+  object). The elements of a memory or `Ref` of pointers (`Vector{String}` as `Ptr{Cstring}`,
+  which Base converts to a vector of pointers, or a `Ref{Ptr{T}}` out-parameter) are passed
+  each as a pointer argument is, recursively, and after the call a pointer C left as it was is
+  the pointer it was, one it changed its new address without owner; those of a memory of values
+  holding pointers are stored as in C memory. A pointer into a Julia object in a struct passed
+  by value is an error (a field says nothing of the object to copy, its size or its lifetime).
+  The copy costs O(n) per call in the size of the object: data a program passes to C at every
+  call is better kept in C memory (`Libc.malloc`), where it is passed as its address, without
+  a copy. C may not keep a pointer to a copy after the call (natively it may keep one into the
+  object, while it lives).
+- **The space of a call** (copies, structs by value and results, the variadic buffer) is the C
+  stack's, allocated by the C module's exports (`CLinkage(stack_save, stack_alloc,
+  stack_restore)`, emscripten's `emscripten_stack_get_current`, `_emscripten_stack_alloc`,
+  `_emscripten_stack_restore`), up to `stack_limit` bytes per call (16 KiB of emscripten's
+  64 KiB), and the C heap's beyond (`malloc`, `free`). It is released when the call returns,
+  and when a Julia exception leaves it (a `try_table` catching every exception releases it and
+  throws the exception on): an error of a copy, or later of a C function's callback. A trap
+  (in a module where nothing catches, a Julia exception is one) leaves the C stack pointer
+  where it was moved: the next calls' space is below it.
+- **Measured** (`test/clinkage/benchmark.jl`, Node.js 24, aarch64 macOS): a scalar C call in a
+  loop runs at about native speed (1.1×); a call passing a `Vector{Float64}` of 10^5 elements,
+  copied to C memory and back, about 2.7× native's; stores and loads through a pointer into C
+  memory about 1.5×.
+- **Not yet.** C calling back into Julia: a `@cfunction` pointer passed to C would have to be an
+  index of the C module's indirect function table (`__indirect_function_table`, which emscripten
+  grows only with `-sALLOW_TABLE_GROWTH`), where the module would put its `cfunction`s (WasmGC
+  references to functions of the C ABI's Wasm types), instead of a table of its own (section 7),
+  and a `ccall` through a C function pointer would call through that table. Also: `cglobal` of
+  the C module's data, a C module with a 32-bit memory, a pointer loop carry whose owner is
+  known to be null (it is tested at each access).
