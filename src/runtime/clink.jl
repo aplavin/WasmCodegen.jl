@@ -43,10 +43,11 @@ memmove(dst::UInt64, src::UInt64, n::UInt64) = ccall((:memmove, LIBRARY), Cvoid,
 "`memset` of the C module's memory (`memory.fill`)."
 memset(dst::UInt64, b::UInt8, n::UInt64) = ccall((:memset, LIBRARY), Cvoid, (UInt64, UInt8, UInt64), dst, b, n)
 """
-The bytes of the object `o` as Julia lays them out natively: of a memory, its elements' (of a
-string or symbol, its bytes, without the NUL after them); of a mutable object, its fields'; -1
-for an object whose bytes are not addressable (a memory of references or of elements stored
-otherwise than natively).
+The number of bytes of the object `o` as Julia lays it out natively, for an object whose bytes
+the pointer helpers address: a memory of isbits elements (stored as laid out, or as their
+leaves: `length * aligned_sizeof`), a string or symbol (its bytes, without the NUL after them),
+a mutable object whose fields are all isbits (its `sizeof`); -1 for any other (a memory of
+references or of elements holding references, a mutable object with a field that is not isbits).
 """
 owner_nbytes(@nospecialize(o)) = ccall((:owner_nbytes, LIBRARY), Int, (Any,), o)
 """

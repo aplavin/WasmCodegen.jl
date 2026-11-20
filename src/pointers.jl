@@ -890,6 +890,14 @@ function ptr_byte_helper!(cgm::CGModule, kind)
     end
 end
 
+# push whether the type id in the local `tid` is one of `ids`
+function push_tid_in!(b::Builder, tid::Int, ids)
+    for (k, id) in enumerate(ids)
+        emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+        k > 1 && emit!(b, :i32_or)
+    end
+end
+
 # the owners whose bytes are addressable, by the Wasm types of their objects (object struct
 # type, array type, element storage) => their type ids: memories whose elements are stored
 # as Julia lays them out, strings and symbols
@@ -1228,10 +1236,7 @@ function finish_byte_view!(cgm::CGModule, f::Func, owners)
     emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :local_set, tid)
     for ((st, a, stg), ids) in owners
         (a == at && stg === I8) || continue
-        for (k, id) in enumerate(ids)
-            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
-            k > 1 && emit!(b, :i32_or)
-        end
+        push_tid_in!(b, tid, ids)
         if!(b)
         emit!(b, :local_get, 0); emit!(b, :ref_cast, st)
         emit!(b, :struct_get, st, DATA_FIELD)
@@ -1276,10 +1281,7 @@ function finish_pointers!(cgm::CGModule)
         for ((st, at, stg), ids) in owners
             s = storage_bytes(stg)
             a = get!(() -> add_local!(f, RefType(at, true)), arrays, at)
-            for (k, id) in enumerate(ids)
-                emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
-                k > 1 && emit!(b, :i32_or)
-            end
+            push_tid_in!(b, tid, ids)
             if!(b)
             emit!(b, :local_get, 1); emit!(b, :ref_cast, st)
             emit!(b, :struct_get, st, DATA_FIELD)
@@ -1453,10 +1455,7 @@ function finish_typed_ptr_helper!(cgm::CGModule, f::Func, kind::Symbol, owners, 
     for ((st, at, stg), ids) in owners
         storage_bytes(stg) == n || continue
         a = get!(() -> add_local!(f, RefType(at, true)), arrays, at)
-        for (k, id) in enumerate(ids)
-            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
-            k > 1 && emit!(b, :i32_or)
-        end
+        push_tid_in!(b, tid, ids)
         emit!(b, :local_get, off); emit!(b, :i64_const, n - 1); emit!(b, :i64_and); emit!(b, :i64_eqz)
         emit!(b, :i32_and)
         if!(b)
@@ -1479,10 +1478,7 @@ function finish_typed_ptr_helper!(cgm::CGModule, f::Func, kind::Symbol, owners, 
     for ((st, at, stg), ids) in owners
         stg === I8 || continue
         a = get!(() -> add_local!(f, RefType(at, true)), arrays, at)
-        for (k, id) in enumerate(ids)
-            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
-            k > 1 && emit!(b, :i32_or)
-        end
+        push_tid_in!(b, tid, ids)
         if!(b)
         emit!(b, :local_get, 1); emit!(b, :ref_cast, st)
         emit!(b, :struct_get, st, DATA_FIELD)
@@ -1649,10 +1645,7 @@ function finish_typed_view!(cgm::CGModule, f::Func, stg, owners)
     emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :local_set, tid)
     for ((st, a, s), ids) in owners
         (a == at && s === stg) || continue
-        for (k, id) in enumerate(ids)
-            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
-            k > 1 && emit!(b, :i32_or)
-        end
+        push_tid_in!(b, tid, ids)
         if!(b)
         emit!(b, :local_get, 0); emit!(b, :ref_cast, st)
         emit!(b, :struct_get, st, DATA_FIELD)

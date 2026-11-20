@@ -210,6 +210,8 @@ an error (`Unsupported`) naming what cannot be.
 function c_abi(@nospecialize(T), result::Bool)
     result && (T === Cvoid || T === Nothing) && return CAbi(:none, Nothing)
     T isa DataType || unsupported("the type ", T, ", which is not a concrete type")
+    result && is_ref_type(T) &&
+        unsupported("the result type ", T, " (a pointer C returns is declared Ptr{", c_pointee(T), "})")
     if is_ptr_type(T) || (!result && is_ref_type(T))
         return CAbi(:pointer, c_pointee(T))
     end
@@ -734,9 +736,9 @@ end
     finish_clinkage!(cgm)
 
 The bodies of the helpers of `Runtime.CLink` over the module's types, by the type id of the
-object: `jl_c_owner_nbytes(o)`, the bytes of `o` as natively laid out (of a string or symbol,
-of a memory whose bytes the pointer helpers address, of a mutable object whose fields they
-address), else -1; `jl_c_copy_elements(o, off, c, n, back)`, for a memory whose elements are
+object: `jl_c_owner_nbytes(o)`, the number of bytes of `o` as natively laid out
+(`Runtime.CLink.owner_nbytes`: of a string or symbol, of a memory whose bytes the pointer
+helpers address, of a mutable object whose fields are all isbits), else -1; `jl_c_copy_elements(o, off, c, n, back)`, for a memory whose elements are
 stored as natively laid out (and a string or symbol), the `n` bytes of its array from its byte
 `off` copied to the C module's memory at `c` (or back), one element at a time (of whole elements
 only: else 0).
@@ -746,14 +748,6 @@ function finish_clinkage!(cgm::CGModule)
     f === nothing || finish_owner_nbytes!(cgm, f::Func)
     f = get(cgm.helpers, (:clink, :copy_elements), nothing)
     f === nothing || finish_copy_elements!(cgm, f::Func)
-end
-
-# push whether the type id in the local `tid` is one of `ids`
-function push_tid_in!(b::Builder, tid::Int, ids)
-    for (k, id) in enumerate(ids)
-        emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
-        k > 1 && emit!(b, :i32_or)
-    end
 end
 
 function finish_owner_nbytes!(cgm::CGModule, f::Func)

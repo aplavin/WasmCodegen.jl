@@ -352,6 +352,7 @@ ct_bad_f16(x::Float16) = ccall((:ct_div64, libctest), Float64, (Float16, Float64
 ct_bad_i128(x::Int128) = ccall((:ct_mul64, libctest), Int64, (Int128, Int64), x, 1)
 ct_bad_two(x::Int32) = ccall((:ct_mul32, libctest), Int32, (Int32, Int32), x, x) +
                        ccall((:ct_mul32, libctest), Int64, (Int64, Int64), Int64(x), Int64(x))
+ct_bad_ref_result() = ccall((:ct_get_io, libctest), Ref{CtIO}, ())
 ct_bad_bytes(v::Vector{UInt8}) = ccall((:send, "ct_host"), Cvoid, (Vector{UInt8},), v)
 # (a C library not linked: as without a C module)
 ct_other_lib(x::Int32) = ccall((:ct_mul32, "libother"), Int32, (Int32, Int32), x, x)
@@ -420,7 +421,8 @@ end
                          (ct_bad_mutable, (CtMutable,), "CtMutable by value"),
                          (ct_bad_f16, (Float16,), "the type Float16, which no scalar"),
                          (ct_bad_i128, (Int128,), "the type Int128, which no scalar"),
-                         (ct_bad_two, (Int32,), "calls of the C function ct_mul32 with two Wasm types")]
+                         (ct_bad_two, (Int32,), "calls of the C function ct_mul32 with two Wasm types"),
+                         (ct_bad_ref_result, (), "the result type Ref{CtIO} (a pointer C returns is declared Ptr{CtIO})")]
         msg = ct_unsupported(f, T)
         @test msg isa String && occursin(what, msg) && occursin("ct_", msg)
         msg isa String && occursin(what, msg) || @info "unexpected" f msg

@@ -792,10 +792,19 @@ C owns.
   sret, a pointer it wrote: an out-parameter, a field, an element of an array of pointers it
   permuted) that is in a copy of the call is mapped, before the copies are dropped, to the
   pointer into that copy's object at the same offset (or one past its end); any other address
-  is a C address. The copy costs O(n) per call in the size of the object: data a program passes
-  to C at every call is better kept in C memory (`Libc.malloc`), where it is passed as its
-  address, without a copy. C may not keep a pointer to a copy after the call (natively it may
-  keep one into the object, while it lives).
+  is a C address.
+- **What the copies cannot preserve.** (1) A copy is made per call, so the address C sees for a
+  Julia object differs from call to call and from the pointer's own (a virtual address): C
+  using a `void*` into a Julia object as an identity (a key, a handle compared across calls)
+  does not work; identities given to C are integers, or C memory. (2) C may not keep a pointer
+  into a copy after the call: the copy is released (natively C may keep a pointer into the
+  object while it lives). (3) A pointer into a Julia object that lost its owner (an integer
+  round trip, `Ptr{T}(UInt(p))`) is a C address under the C linkage: it is passed as that
+  number, and a load through it reads C memory there. (4) The whole owner is copied, both ways,
+  at every call: all of the `Memory` behind an array (its capacity, not only its length), the
+  parent array of a view, a whole string: O(n) time and C stack or heap space per call in the
+  owner's size, whatever part C reads. Data a program passes to C at every call is better kept
+  in C memory (`Libc.malloc`), passed as its address without a copy.
 - **The space of a call.** What a call needs that is known when compiling (its result by
   sret, its structs by value, its variadic buffer) is one block of the C stack, allocated by the
   C module's exports (`CLinkage(stack_save, stack_alloc, stack_restore)`, emscripten's
