@@ -1,11 +1,13 @@
 // Persistent runner: NDJSON requests on stdin, one response per line.
-// {id, wasm (base64) | wasmId, fn, args: [{t, bits}], results: [t...], wasi?: {env, args, preopens}}
+// {id, wasm (base64) | wasmId, fn, args: [{t, bits}], results: [t...], wasi?: {env, args, preopens},
+//  c?: {module, js}}
 // (a request with `wasi` options runs a new instance of a WASI module, with those options)
 import { createInterface } from 'node:readline';
 import { WASI } from 'node:wasi';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { createHost } from '../js/julia.mjs';
 import { makeJuliaIOPaths, makeJuliaIOEvents, PATH_IMPORTS, EVENT_IMPORTS } from '../js/julia_io.mjs';
 const modules = new Map();
@@ -92,12 +94,42 @@ async function instantiate(mod, opts = {}) {
     return { inst, suspends: events !== null };
   }
   const host = createHost({ write: (fd, b) => { for (const x of b) bytes.push(x); } });
+  // (a module linked with a C module, `Config(c_linkage)`: the C module's exports)
+  const c = opts.c ? await cModule(opts.c.js) : null;
   for (const imp of imports) {
+    if (c && imp.module === opts.c.module) {
+      if (!(imp.name in c)) throw new Error('the C module has no export ' + imp.name);
+      continue;
+    }
     if (imp.module !== 'julia' || !(imp.name in host.imports.julia)) throw new Error('unknown host function ' + imp.module + '.' + imp.name);
   }
-  const inst = await WebAssembly.instantiate(mod, { julia: host.imports.julia });
+  const inst = await WebAssembly.instantiate(mod, c ? { julia: host.imports.julia, [opts.c.module]: c } : { julia: host.imports.julia });
   host.attach(inst);
   return { inst, suspends: false };
+}
+// The C modules (emscripten's output, MODULARIZE and EXPORT_ES6, its .wasm next to its .mjs), by
+// path: one instance each, whose state (its globals, its heap) the modules linked with it
+// share, as a native library's in a process. Its Wasm exports as they are (the `Module`'s
+// `wasmExports` wraps some of a memory64 module's to convert BigInts), captured where
+// emscripten's loader instantiates it; what it prints is the output of the call.
+const cmodules = new Map();
+async function cModule(js) {
+  let c = cmodules.get(js);
+  if (!c) {
+    const { default: create } = await import(pathToFileURL(js).href);
+    let raw;
+    await create({
+      instantiateWasm(imports, done) {
+        WebAssembly.instantiate(fs.readFileSync(js.replace(/\.m?js$/, '.wasm')), imports)
+          .then(({ instance }) => { raw = instance.exports; done(instance); });
+        return {};
+      },
+      print: (s) => { output += s + '\n'; },
+      printErr: (s) => { output += s + '\n'; },
+    });
+    cmodules.set(js, c = raw);
+  }
+  return c;
 }
 function takeOutput() {
   output += decoder.decode(new Uint8Array(bytes));
@@ -129,12 +161,13 @@ rl.on('line', async (line) => {
   if (!line.trim()) return;
   const req = JSON.parse(line);
   try {
-    const key = req.wasi ? req.wasmId + JSON.stringify(req.wasi) : req.wasmId;
+    // (a module linked with a C module: an instance per C module)
+    const key = req.wasi ? req.wasmId + JSON.stringify(req.wasi) : req.c ? req.wasmId + ' ' + req.c.js : req.wasmId;
     let m = req.wasi ? undefined : modules.get(key);
     if (!m) {
       const bytes = Buffer.from(req.wasm, 'base64');
       const mod = await WebAssembly.compile(bytes, { builtins: ['js-string'] });
-      m = await instantiate(mod, req.wasi);
+      m = await instantiate(mod, req.wasi ?? (req.c ? { c: req.c } : undefined));
       req.wasi || modules.set(key, m);
     }
     takeOutput();

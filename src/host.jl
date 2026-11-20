@@ -125,6 +125,20 @@ function import_bytes_func!(cgm::CGModule)
     end
 end
 
+"""
+    c_memory!(cgm) -> LinearMemory
+
+The memory of the C module the module is linked with (`Config(c_linkage)`): its 64-bit memory,
+imported (`clinkage.jl`). The module has no memory of its own then.
+"""
+function c_memory!(cgm::CGModule)
+    get!(cgm.helpers, :c_memory) do
+        cl = cgm.config.c_linkage
+        cl === nothing && error("WasmCodegen: the C module's memory in a module without Config(c_linkage)")
+        add_memory!(cgm.mod, 0; index64=true, imported=(cl.import_module, cl.memory))
+    end
+end
+
 ## WASI
 
 const WASI = "wasi_snapshot_preview1"
@@ -151,6 +165,11 @@ wasi_import!(cgm::CGModule, name::AbstractString, params::Vector{ValType}) =
 
 "The module's linear memory, for WASI's calls: one page, exported as `memory`."
 wasi_memory!(cgm::CGModule) = get!(cgm.helpers, :wasi_memory) do
+    # (a module linked with a C module has only the C module's memory, whose bytes are the C
+    # module's to place: none of the fixed offsets of the module's own use of a memory)
+    cgm.config.c_linkage === nothing ||
+        unsupported("a linear memory of the module's own (WASI's, or the bytes of host imports) in ",
+                    "a module linked with a C module (Config(c_linkage))")
     mem = add_memory!(cgm.mod, 1)
     add_export!(cgm.mod, "memory", mem)
     mem

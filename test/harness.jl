@@ -92,9 +92,13 @@ function from_leaves(@nospecialize(T), bits::Vector{String}, pos::Ref{Int})
 end
 
 """
-    wasm_run(c::Compilation, name, args...; rettype) -> value, or (:trap, msg)
+    wasm_run(c::Compilation, name, args...; rettype, cmodule) -> value, or (:trap, msg)
+
+With `cmodule`, the path of the JavaScript of a C module (emscripten's, `Config(c_linkage)`)
+whose exports the module imports.
 """
-function wasm_run(c, name::String, args...; rettype, wasi_env=nothing, wasi_args=nothing, preopens=nothing, wasi_faults=nothing)
+function wasm_run(c, name::String, args...; rettype, wasi_env=nothing, wasi_args=nothing, preopens=nothing, wasi_faults=nothing,
+                  cmodule=nothing)
     r = runner(suspends(c))
     id = (REQ_ID[] += 1)
     wasmid = bytes2hex(sha1(c.bytes))
@@ -110,6 +114,8 @@ function wasm_run(c, name::String, args...; rettype, wasi_env=nothing, wasi_args
                            "preopens" => something(preopens, Dict{String,String}()),
                            "faults" => something(wasi_faults, []))
     end
+    cmodule === nothing ||
+        (req["c"] = Dict("module" => c.cgm.config.c_linkage.import_module, "js" => cmodule))
     println(r, JSON.json(req))
     resp = JSON.parse(readline(r))
     haskey(resp, "error") && error("runner: ", resp["error"])

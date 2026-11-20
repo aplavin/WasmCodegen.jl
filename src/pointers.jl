@@ -267,6 +267,23 @@ function ptr_load!(fc::FnCtx, p::CGVal, i::CGVal, @nospecialize(T))
         return outlined_memoryrefget!(fc, element_ref!(fc, o, i, T), const_value(fc, false), T)
     end
     isbitstype(T) || unsupported("a load of a ", T, " through a pointer")
+    if o === nothing && c_linked(fc) && layout(fc, T).kind !== Ghost
+        # an address in the C module's memory when it has no owner (known now, or tested)
+        ownerless(p) && return c_load!(fc, p, i, T)
+        if ptr_owner(p) isa Int
+            r = new_val!(fc, T)
+            push_leaf!(fc, ptr_owner(p)); emit!(fc.b, :ref_is_null)
+            if!(fc.b); assign!(fc, r, c_load!(fc, p, i, T))
+            else!(fc.b); assign!(fc, r, owned_load!(fc, p, i, T))
+            end!(fc.b)
+            return r
+        end
+    end
+    return owned_load!(fc, p, i, T)
+end
+
+# `unsafe_load(p, i)` through a pointer into its owner
+function owned_load!(fc::FnCtx, p::CGVal, i::CGVal, @nospecialize(T))
     byte = byte_offset!(fc, p, i, T)
     leaves = LeafVal[]
     for (P, off) in bit_leaves(T)
@@ -324,6 +341,23 @@ function ptr_store!(fc::FnCtx, p::CGVal, v::CGVal, i::CGVal)
         return p
     end
     isbitstype(T) || unsupported("a store of a ", T, " through a pointer")
+    if o === nothing && c_linked(fc) && layout(fc, T).kind !== Ghost
+        ownerless(p) && (c_store!(fc, p, v, i); return p)
+        if ptr_owner(p) isa Int
+            push_leaf!(fc, ptr_owner(p)); emit!(fc.b, :ref_is_null)
+            if!(fc.b); c_store!(fc, p, v, i)
+            else!(fc.b); owned_store!(fc, p, v, i)
+            end!(fc.b)
+            return p
+        end
+    end
+    owned_store!(fc, p, v, i)
+    return p
+end
+
+# `unsafe_store!(p, v, i)` through a pointer into its owner
+function owned_store!(fc::FnCtx, p::CGVal, v::CGVal, i::CGVal)
+    T = v.typ
     byte = byte_offset!(fc, p, i, T)
     for ((P, off), leaf) in bits_value_leaves(fc, v, T)
         if P === :owner
@@ -728,6 +762,80 @@ function leaf_to_bits!(fc::FnCtx, leaf::LeafVal, @nospecialize(P))
     r = new_local!(fc, I64)
     emit!(fc.b, :local_set, r)
     return r
+end
+
+## the memory of a C module (`Config(c_linkage)`, `clinkage.jl`)
+
+"""
+Whether the pointer `p` is known to have no owner where it is compiled (made from an integer,
+the result of a C function, loaded from the C module's memory, or moved from one of these):
+with a C module, an address in its memory.
+"""
+ownerless(p::CGVal) = (o = ptr_owner(p); o isa Inst && o.op === :ref_null)
+
+"The load (or `store`) of the C module's memory of a primitive leaf of Wasm type `t` and `n` bytes."
+function c_access_op(t::ValType, n::Int, store::Bool)
+    t === F32 && return store ? :f32_store : :f32_load
+    t === F64 && return store ? :f64_store : :f64_load
+    t === I64 && n == 8 && return store ? :i64_store : :i64_load
+    t === I32 && n == 4 && return store ? :i32_store : :i32_load
+    t === I32 && n == 2 && return store ? :i32_store16 : :i32_load16_u
+    t === I32 && n == 1 && return store ? :i32_store8 : :i32_load8_u
+    error("WasmCodegen: no access of the C memory for $n bytes of $t")
+end
+
+"""
+    c_load!(fc, p, i, T) -> CGVal
+
+`unsafe_load(p, i)` of a pointer without owner: the value of the isbits type `T` at its address
+in the C module's memory, each primitive leaf one load, little-endian as Julia lays it out; a
+pointer in it has no owner.
+"""
+function c_load!(fc::FnCtx, p::CGVal, i::CGVal, @nospecialize(T))
+    c_memory!(fc.cgm)
+    _, a = byte_offset!(fc, p, i, T)
+    leaves = LeafVal[]
+    for (P, off) in bit_leaves(T)
+        if P === :owner
+            push!(leaves, Inst(:ref_null, fc.cgm.types.jlvalue))
+            continue
+        end
+        t, n = prim_wtype(fc, P), nbytes(P)
+        emit!(fc.b, :local_get, a)
+        emit!(fc.b, c_access_op(t, n, false), trailing_zeros(n), off)
+        r = new_local!(fc, t)
+        emit!(fc.b, :local_set, r)
+        push!(leaves, r)
+    end
+    l = layout(fc, T)
+    (l.kind === Inline && length(l.leaves) == length(leaves)) ||
+        unsupported("a load of a ", T, " through a pointer")
+    return CGVal(T, Inline, leaves)
+end
+
+"""
+    c_store!(fc, p, v, i; err) -> CGVal
+
+`unsafe_store!(p, v, i)` of a pointer without owner: the bytes of `v` at its address in the C
+module's memory. A pointer into a Julia object in `v` cannot be meaningful there (the C module
+cannot address the object): `err` (a runtime function) is thrown, before any byte is stored.
+"""
+function c_store!(fc::FnCtx, p::CGVal, v::CGVal, i::CGVal; err=Runtime.CLink.throw_owned_store)
+    T = v.typ
+    c_memory!(fc.cgm)
+    ls = collect(bits_value_leaves(fc, v, T))
+    for ((P, _), leaf) in ls
+        P === :owner && check_ownerless!(fc, leaf, err)
+    end
+    _, a = byte_offset!(fc, p, i, T)
+    for ((P, off), leaf) in ls
+        P === :owner && continue
+        t, n = prim_wtype(fc, P), nbytes(P)
+        emit!(fc.b, :local_get, a)
+        push_leaf!(fc, leaf)
+        emit!(fc.b, c_access_op(t, n, true), trailing_zeros(n), off)
+    end
+    return p
 end
 
 ## the run-time helpers

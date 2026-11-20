@@ -66,6 +66,7 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
     config.host in (:js, :wasi) || throw(ArgumentError("Config: host must be :js or :wasi, got $(repr(config.host))"))
     check_import_libraries(config)
     check_foreign_functions(config)
+    check_c_linkage(config)
     # (and a JavaScript module that may pass bytes to its declared imports exports its memory as
     # WASI's: a host takes an `_initialize` with it for WASI's, `js/julia.mjs`)
     reserved = config.host === :wasi || !isempty(config.import_libraries)
@@ -230,7 +231,9 @@ function emit_module(w::ClosedWorld, mis::Vector{Core.MethodInstance}, entries::
     end
     if config.optimize !== nothing
         t = time_ns()
-        bytes = wasm_opt(bytes, config.optimize)
+        # (memory64 for the memory of a C module, `Config(c_linkage)`)
+        memory64 = cgm.mod.memory !== nothing && cgm.mod.memory.index64
+        bytes = wasm_opt(bytes, memory64 ? `$(config.optimize) --enable-memory64` : config.optimize)
         config.progress && progress(config, "optimize", t, length(bytes), " bytes after wasm-opt ",
                                     join(config.optimize.exec, ' '))
     end
@@ -295,6 +298,7 @@ function finish_module!(cgm::CGModule)
     finish_tuples!(cgm)
     finish_objectid!(cgm)
     finish_pointers!(cgm)
+    finish_clinkage!(cgm)
     finish_types!(cgm)
     finish_subtype!(cgm)
     finish_host!(cgm)

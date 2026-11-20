@@ -1,6 +1,37 @@
 # The state of a compilation: one `CGModule` per Wasm module, one `FnCtx` per function.
 
 """
+    CLinkage(; libraries, import_module="c", memory="memory", ...)
+
+The linkage of a module with one C module compiled to Wasm (`Config(c_linkage)`, see
+`clinkage.jl`), which owns the only linear memory: a 64-bit one (memory64, as emscripten's
+`-m64` builds and clang's `wasm64` target make), whose exports the module imports.
+
+- `libraries`: the identities of the libraries whose functions are the C module's: a
+  `ccall((name, lib), ...)` whose `lib` is one of them (equal as a `String` or a `Symbol`) is a
+  call of the import `import_module.name`. `lib` is resolved when the module is compiled: a
+  constant, or a global variable, constant or not, by its value in the build process then (as
+  a JLL package's `__init__` sets `libfoo` to the path of its library: the path the build
+  process has is what counts, the image being a snapshot of that process). Calls of other
+  libraries are as without a C module;
+- `import_module`: the module name of the imports (`"c"`);
+- `memory`: the name of the C module's memory export, imported as the module's memory;
+- `malloc`, `free`: the C module's allocator, for `Libc.malloc`, `Libc.free` (and `Libc.calloc`,
+  `Libc.realloc`, imported by their own names);
+- `memory64`: must be `true`: only C modules with a 64-bit memory are supported (their
+  pointers, `size_t` and `long` are 8 bytes, as Julia's on 64-bit platforms, so that structs
+  are laid out as natively).
+"""
+Base.@kwdef struct CLinkage
+    libraries::Vector{Union{String,Symbol}}
+    import_module::String = "c"
+    memory::String = "memory"
+    malloc::String = "malloc"
+    free::String = "free"
+    memory64::Bool = true
+end
+
+"""
     Config(; on_unsupported=:error)
 
 The configuration of the code generator:
@@ -59,7 +90,11 @@ The configuration of the code generator:
   program is inferred and before its code and image are emitted, which is when the image
   reads the values of globals: to reset state of the build process the module must not
   hold. A hook may return a function, called (in reverse order) when the compilation ends,
-  to restore what it changed.
+  to restore what it changed;
+- `c_linkage`: a [`CLinkage`](@ref), to link the module with a C module compiled to Wasm (one
+  that owns a 64-bit linear memory, as emscripten's `-m64` builds): the module imports that
+  memory and the C functions its `ccall`s of the configured libraries name; a pointer without
+  owner is an address in that memory (`clinkage.jl`). `nothing` (the default): no C module.
 """
 Base.@kwdef struct Config
     on_unsupported::Symbol = :error
@@ -103,6 +138,7 @@ Base.@kwdef struct Config
     immutable objects (an ODE integrator holding callbacks whose closures capture it) can be
     serialized."
     shell_first_mutables::Bool = false
+    c_linkage::Union{Nothing,CLinkage} = nothing
 end
 
 """

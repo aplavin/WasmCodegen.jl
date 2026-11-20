@@ -106,6 +106,8 @@ What reaches a C function that cannot run in a closed world (the Julia API, and 
 the message of the unsupported call: by a pattern of the function's name.
 """
 const FOREIGNCALL_HINTS = Pair{Regex,String}[
+    r"^jl_ptr_to_array" =>
+        "unsafe_wrap: an array cannot share the bytes a pointer points to (Wasm GC arrays are not linear memory, the memory of a C module included): copy them, unsafe_copyto!",
     r"^jl_(dlopen|dlclose|dlsym|dllist|load_dynamic_library|pathname_for_handle|lazy_load_and_lookup|load_and_lookup|libdl_dlopen_func)" =>
         "Libdl.dlopen/dlsym: there are no dynamic libraries in Wasm",
     r"^jl_(toplevel_eval|eval_string|load_$|load$|load_file_string|fl_parse|fl_lower|macroexpand|parse|lower|expand|method_def|declare_const|set_const|f_new_module|begin_new_module|end_new_module|module_import|module_using|eval_globalref)" =>

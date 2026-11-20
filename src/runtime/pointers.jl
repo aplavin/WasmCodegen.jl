@@ -4,6 +4,19 @@
 
 "`memmove(dst, src, n)`: the `n` bytes at `src` copied to `dst`, which may overlap."
 function ptr_memmove(dst::Ptr{UInt8}, src::Ptr{UInt8}, n::UInt)
+    if CLink.linked()
+        # with a C module, a pointer without owner is an address in its memory: between two,
+        # `memory.copy`; between one and an array whose elements are laid out as natively, one
+        # loop over the elements (`CLink.copy_elements`), else the loops below
+        od, os = ptr_owner(dst), ptr_owner(src)
+        if od === nothing && os === nothing
+            CLink.memmove(UInt64(UInt(dst)), UInt64(UInt(src)), UInt64(n))
+            return dst
+        elseif n <= UInt(typemax(Int32)) && (od === nothing) != (os === nothing)
+            c, p, back = od === nothing ? (dst, src, false) : (src, dst, true)
+            CLink.copy_elements(ptr_owner(p), ptr_offset(p), UInt64(UInt(c)), Int(n), back) && return dst
+        end
+    end
     # between memories of bytes (or from a String): one `array.copy` (which may overlap), or
     # a loop over the String's bytes, without finding the owners at each byte
     if n <= UInt(typemax(Int32))
@@ -59,6 +72,11 @@ end
 
 "`memset(p, b, n)`: the `n` bytes at `p` set to `b`."
 function ptr_memset(p::Ptr{UInt8}, b::UInt8, n::UInt)
+    # (an address in the memory of a C module: `memory.fill`)
+    if CLink.linked() && ptr_owner(p) === nothing
+        CLink.memset(UInt64(UInt(p)), b, UInt64(n))
+        return p
+    end
     i = UInt(1)
     if UInt(p) % UInt(8) == 0
         w = UInt64(b) * 0x0101010101010101

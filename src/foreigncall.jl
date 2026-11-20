@@ -1,6 +1,7 @@
 # Foreign calls: the few calls into Julia's C runtime that Base's code makes for things
 # Wasm does natively (allocation, strings as bytes, copies of memory). Others are
-# unsupported; calls into C libraries need runtime functions or host imports.
+# unsupported; calls into C libraries need runtime functions, host imports or a C module
+# linked with the module (`clinkage.jl`).
 
 function foreigncall_name(@nospecialize(x))
     x isa QuoteNode && (x = x.value)
@@ -17,12 +18,15 @@ function foreigncall_name(@nospecialize(x))
     return nothing
 end
 
-# the library of a foreign call `ccall((name, library), ...)` given as a constant string, in
-# the forms `foreigncall_name` accepts
-function foreigncall_library(@nospecialize(x))
+# the library of a foreign call `ccall((name, library), ...)`, a `String` or a `Symbol`, in the
+# forms `foreigncall_name` accepts: a constant, or a global variable, constant or not, by its
+# value in the program's `world` now (a JLL package's `libfoo`, set by its `__init__`: the
+# module is a snapshot of the build process, and the library its calls mean is the one the
+# build process has)
+function foreigncall_library(@nospecialize(x), world::UInt)
     x isa QuoteNode && (x = x.value)
-    x isa Tuple && return length(x) == 2 && x[2] isa String ? x[2] : nothing
-    x isa GlobalRef && isconst(x.mod, x.name) && return foreigncall_library(getglobal(x.mod, x.name))
+    x isa Tuple && return length(x) == 2 && x[2] isa Union{String,Symbol} ? x[2] : nothing
+    x isa GlobalRef && return foreigncall_library(something(global_value(world, x), Some{Any}(nothing)), world)
     lib = if x isa Expr && x.head === :call && length(x.args) == 3 &&
              (x.args[1] === Core.tuple || x.args[1] == GlobalRef(Core, :tuple))
         # `Core.tuple(name, library)` (Julia 1.12; the callee is a `GlobalRef` in its IR)
@@ -34,9 +38,15 @@ function foreigncall_library(@nospecialize(x))
         nothing
     end
     lib isa QuoteNode && (lib = lib.value)
-    # (a constant naming it: `Base.PCRE.PCRE_LIB`)
-    lib isa GlobalRef && isconst(lib.mod, lib.name) && (lib = getglobal(lib.mod, lib.name))
-    return lib isa String ? lib : nothing
+    # (a global naming it: `Base.PCRE.PCRE_LIB`, a constant; a JLL's `libfoo`, set at its load)
+    lib isa GlobalRef && (lib = something(global_value(world, lib), Some{Any}(nothing)))
+    return lib isa Union{String,Symbol} ? lib : nothing
+end
+
+# the value of the global `ref` in `world`, constant or not, or nothing where it is undefined
+function global_value(world::UInt, ref::GlobalRef)
+    Base.invoke_in_world(world, isdefinedglobal, ref.mod, ref.name) || return nothing
+    return Some{Any}(Base.invoke_in_world(world, getglobal, ref.mod, ref.name))
 end
 
 ## libraries of host imports the program declares (`Config(import_libraries)`)
@@ -100,6 +110,12 @@ function emit_import_ccall!(fc::FnCtx, lib::String, name::Symbol, ex::Expr, args
     (RT === Cvoid || RT in IMPORT_SCALARS) && isempty(bad) ||
         error("WasmCodegen: the host import $lib.$name has a type other than Int32, UInt32, Int64, " *
               "UInt64 (or Cvoid as its result): $RT ($(join(ATs, ", ")))")
+    # (the bytes are copied to the module's own memory, at offsets of its own: a module linked
+    # with a C module has the C module's memory only, which is not the module's to write)
+    fc.cgm.config.c_linkage === nothing || !any(T -> T in IMPORT_BYTES, ATs) ||
+        unsupported("bytes as an argument of the host import ", lib, ".", name, " in a module linked ",
+                    "with a C module (Config(c_linkage)): the linear memory is the C module's; pass the ",
+                    "address of bytes in it (Libc.malloc) instead")
     # (its pointers are offsets of the runtime's part of the memory: `Runtime.Staging`)
     lib in IMPORT_LIBRARIES && staging_memory!(fc.cgm)
     vals = CGVal[convert_repr(fc, a::CGVal, T) for (a, T) in zip(args, ATs)]
@@ -216,13 +232,19 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     name = foreigncall_name(ex.args[1])
     nargs = length(ex.args[3]::Core.SimpleVector)
     args = Any[operand(fc, a) for a in ex.args[6:5+nargs]]
-    lib = foreigncall_library(ex.args[1])
+    lib = foreigncall_library(ex.args[1], fc.cgm.world.world)
     # (a function the program implements, before the host's of a library it declares)
     if lib == SIMD128.LIBRARY && name isa Symbol && startswith(String(name), "wasm_simd_")
         return emit_simd!(fc, String(name)[11:end], args, typ)   # SIMD128 (simd128.jl)
     end
     f = foreign_function(fc.cgm.config, name, lib)
     f === nothing || return emit_foreign_function!(fc, f, name::Symbol, lib::String, ex, args, typ)
+    # a function of the C module (`Config(c_linkage)`, clinkage.jl), or its allocator's for
+    # `Libc.malloc` and the like
+    if name isa Symbol && is_c_function(fc.cgm, lib, name)
+        return emit_c_call!(fc, name, ex, args, typ)
+    end
+    lib == CLINK_LIBRARY && return emit_clink_primitive!(fc, name, args, typ)
     if lib !== nothing && name !== nothing && (lib in IMPORT_LIBRARIES || lib in fc.cgm.config.import_libraries)
         return emit_import_ccall!(fc, lib, name, ex, args)
     end
