@@ -229,8 +229,14 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
     else
         RT === Cvoid || RT === Nothing ? ghost(Nothing, nothing) : ghost(RT, something(ghost_value(RT)))
     end
-    for k in owned
-        call_runtime!(fc, Runtime.CLink.from_c!, CGVal[void_ptr(vals[k])])
+    if !isempty(owned)
+        # (a pointer C returns into a copy is into its object; the copies of mutable objects
+        # written back, while all are alive)
+        if rabi.kind === :pointer || (rabi.kind === :scalar && is_ptr_type(rabi.type))
+            p = call_runtime!(fc, Runtime.CLink.from_c, CGVal[CGVal(UInt64, Inline, LeafVal[res.leaves[1]])])
+            res = CGVal(RT, Inline, convert_repr(fc, p, Ptr{Cvoid}).leaves)
+        end
+        call_runtime!(fc, Runtime.CLink.back!, CGVal[frame])
     end
     if space
         call_runtime!(fc, Runtime.CLink.leave, CGVal[frame])

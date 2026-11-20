@@ -6,8 +6,9 @@ The run-time side of calls into the C module a module is linked with (`Config(c_
 pointer into one (a pointer with an owner) is passed to C as the address of a copy of its
 owner, made for the call in the space the call allocates (`scratch`: the C stack, or the C
 heap past `stack_limit()` bytes), and copied back into the owner after the call when the owner
-is mutable (`to_c`, `from_c!`). Every pointer of a call into the same owner shares one copy,
-as natively they point into the same object.
+is mutable (`to_c`, `back!`). Every pointer of a call into the same owner shares one copy,
+as natively they point into the same object, and an address C gives back into a copy is a
+pointer into its object again (`from_c`).
 
 The primitives (`ccall`s of the library `LIBRARY`) are compiled by the code generator: to the C
 module's imports (its stack and allocator), to the memory's instructions, and to helpers over
@@ -111,20 +112,20 @@ end
 """
     Copy
 
-The copy of the object `owner` (whose base address is `base`) at `c` in the C module's memory,
-`n` bytes, for the call being made: `kind` `:bytes` (its bytes), `:pointers` (a memory or
-`Ref` of pointers: the address standing for each pointer) or `:values` (a memory or `Ref` of
-isbits values holding pointers, stored as C stores them). Written back after the call if
-`writeback` (a mutable owner), once (`done`).
+The copy of the object `owner` at `c` in the C module's memory, `n` bytes, for the call being
+made; `base` is the pointer to the owner's first byte (its address and the owner), from which
+an address in the copy is mapped back to a pointer into the owner (`from_c`). `kind`: `:bytes`
+(its bytes), `:pointers` (a memory or `Ref` of pointers: the address standing for each pointer)
+or `:values` (a memory or `Ref` of isbits values holding pointers, stored as C stores them).
+Written back after the call if `writeback` (a mutable owner).
 """
 mutable struct Copy
     owner::Any
-    base::UInt64
+    base::Ptr{Cvoid}
     c::UInt64
     n::Int
     kind::Symbol
     writeback::Bool
-    done::Bool
 end
 
 # the copies of the calls being made (a call made by a C function's callback nests), and the
@@ -140,6 +141,29 @@ const STACK_USED = Ref(0)
 The beginning of a call that needs space: the C stack pointer and what `leave` releases.
 """
 @inline enter() = (stack_save(), length(COPIES), length(BLOCKS), STACK_USED[])
+
+"""
+    back!(frame)
+
+After the call `frame` began returned: each copy it made of a mutable object written back into
+the object, whichever pointer of the call (an argument, an element of a memory of pointers, or
+none any longer: C may have moved it) points into it. The pointers among the copied values that C
+changed are mapped back (`from_c`), all copies being alive until `leave`.
+"""
+@inline function back!(frame::Tuple{UInt64,Int,Int,Int})
+    for k in frame[2]+1:length(COPIES)
+        r = @inbounds COPIES[k]
+        r.writeback || continue
+        if r.kind === :pointers
+            Runtime.by_type(pointers_from_c, r.owner, r)
+        elseif r.kind === :values
+            Runtime.by_type(values_from_c, r.owner, r)
+        else
+            copy_bytes!(r.owner, r.c, Ptr{UInt8}(r.base), r.n, true)
+        end
+    end
+    return nothing
+end
 
 """
     leave(frame)
@@ -217,27 +241,74 @@ function to_c(p::Ptr{Cvoid})
     o = ptr_owner(p)
     o === nothing && return a
     k = find_copy(o)
-    k == 0 && (k = copy_owner!(o, a - UInt64(ptr_offset(p)), p - ptr_offset(p)))
+    k == 0 && (k = copy_owner!(o, p - ptr_offset(p)))
     r = @inbounds COPIES[k]
-    return r.c + (a - r.base)
+    return r.c + (a - UInt64(UInt(r.base)))
 end
 
-# the copy of the owner `o` of a pointer whose base pointer is `base` (address `b`): pushed to
-# `COPIES`, its index. Of a memory or `Ref` of pointers (`Vector{String}` as `Ptr{Cstring}`, a
-# `Ref{Ptr{T}}`), each passed as a pointer argument is; of a memory or `Ref` of values holding
-# pointers, each stored as in the C module's memory (a pointer into an object among them an
-# error); of others, the bytes (of a string or symbol, and the NUL after them)
-function copy_owner!(@nospecialize(o), b::UInt64, base::Ptr{Cvoid})
+"""
+    c_address(p) -> address
+
+The address `to_c(p)` gave the pointer `p` for the call being made (its own without an owner or
+a copy of it), without making a copy.
+"""
+function c_address(p::Ptr{Cvoid})
+    a = UInt64(UInt(p))
+    o = ptr_owner(p)
+    o === nothing && return a
+    k = find_copy(o)
+    k == 0 && return a
+    r = @inbounds COPIES[k]
+    return r.c + (a - UInt64(UInt(r.base)))
+end
+
+"""
+    from_c(a) -> pointer
+
+The pointer an address `a` C gave back (a result, a pointer it wrote) stands for: into the
+object whose copy for the call being made holds it (at the same offset, or one past its end, as
+natively a pointer may be), else the C address `a` without an owner. Called before the copies
+are dropped.
+"""
+function from_c(a::UInt64)
+    a == 0 && return Ptr{Cvoid}(a)
+    for k in length(COPIES):-1:1
+        r = @inbounds COPIES[k]
+        a - r.c < UInt64(r.n) && return r.base + (a - r.c)
+    end
+    # (past the end: of the object whose copy ends there, an empty one included)
+    for k in length(COPIES):-1:1
+        r = @inbounds COPIES[k]
+        a == r.c + UInt64(r.n) && return r.base + (a - r.c)
+    end
+    return Ptr{Cvoid}(a)
+end
+
+"""
+    back_pointer(a, old) -> pointer
+
+The pointer that a pointer `old` passed to C (an element or field of a copy) is after the call,
+C having left the address `a` there: `old` itself, owner included, if C did not change it, else
+`from_c(a)`.
+"""
+back_pointer(a::UInt64, old::Ptr{Cvoid}) = a == c_address(old) ? old : from_c(a)
+
+# the copy of the owner `o` of a pointer whose base pointer is `base`: pushed to `COPIES`, its
+# index. Of a memory or `Ref` of pointers (`Vector{String}` as `Ptr{Cstring}`, a `Ref{Ptr{T}}`),
+# each passed as a pointer argument is; of a memory or `Ref` of values holding pointers, each
+# stored as in the C module's memory (a pointer into an object among them an error); of others,
+# the bytes (of a string or symbol, and the NUL after them)
+function copy_owner!(@nospecialize(o), base::Ptr{Cvoid})
     # (the copy is pushed first, those of the objects its pointers point into after it)
     k = length(COPIES) + 1
-    (Runtime.by_type(pointers_to_c, o, b) || Runtime.by_type(values_to_c, o, b)) && return k
+    (Runtime.by_type(pointers_to_c, o, base) || Runtime.by_type(values_to_c, o, base)) && return k
     n = owner_nbytes(o)
     n < 0 && throw_not_addressable()
     immutable = o isa String || o isa Symbol
     c = scratch(n + immutable, 16)
     copy_bytes!(o, c, Ptr{UInt8}(base), n, false)
     immutable && unsafe_store!(Ptr{UInt8}(c + n), 0x00)
-    push!(COPIES, Copy(o, b, c, n, :bytes, !immutable, false))
+    push!(COPIES, Copy(o, base, c, n, :bytes, !immutable))
     return length(COPIES)
 end
 
@@ -252,7 +323,7 @@ function pointers_to_c(@nospecialize(o), @nospecialize(b), ::Type{T}) where {T}
     n = nelements(o)
     c = scratch(8n, 8)
     # (the copy first: a pointer among them to the object itself is to the copy)
-    push!(COPIES, Copy(o, b::UInt64, c, 8n, :pointers, true, false))
+    push!(COPIES, Copy(o, b::Ptr{Cvoid}, c, 8n, :pointers, true))
     for i in 1:n
         unsafe_store!(Ptr{UInt64}(c), to_c(Core.bitcast(Ptr{Cvoid}, element(o, i))), i)
     end
@@ -268,7 +339,7 @@ function values_to_c(@nospecialize(o), @nospecialize(b), ::Type{T}) where {T}
     for i in 1:n
         unsafe_store!(Ptr{E}(c), element(o, i), i)
     end
-    push!(COPIES, Copy(o, b::UInt64, c, n * Base.aligned_sizeof(E), :values, true, false))
+    push!(COPIES, Copy(o, b::Ptr{Cvoid}, c, n * Base.aligned_sizeof(E), :values, true))
     return nothing
 end
 
@@ -299,47 +370,21 @@ function copy_bytes!(@nospecialize(o), c::UInt64, p::Ptr{UInt8}, n::Int, back::B
 end
 
 """
-    from_c!(p)
-
-After the call: the copy of the owner of the pointer `p` written back into its owner, once,
-if it is mutable. The pointers of a memory or `Ref` of pointers that the C function left as
-they were stay the pointers they were (their objects written back in turn); one it changed is
-its new address, without an owner.
+The copy `r` of `o`, of the type `T` holding pointers, written back (`back!`): a pointer C left
+as it was stays the pointer it was, owner included; one it changed is the pointer its new
+address stands for (`from_c`).
 """
-function from_c!(p::Ptr{Cvoid})
-    o = ptr_owner(p)
-    o === nothing && return nothing
-    k = find_copy(o)
-    k == 0 && return nothing
-    r = @inbounds COPIES[k]
-    (r.done || !r.writeback) && return nothing
-    r.done = true
-    if r.kind === :pointers
-        Runtime.by_type(pointers_from_c, o, r)
-    elseif r.kind === :values
-        Runtime.by_type(values_from_c, o, r)
-    else
-        copy_bytes!(o, r.c, Ptr{UInt8}(p - (UInt64(UInt(p)) - r.base)), r.n, true)
-    end
-    return nothing
-end
-
-"The copy `r` of `o`, of the type `T` holding pointers, written back (`from_c!`)."
 function pointers_from_c(@nospecialize(o), @nospecialize(r), ::Type{T}) where {T}
     o, r = o::T, r::Copy
     for i in 1:nelements(o)
         q = Core.bitcast(Ptr{Cvoid}, element(o, i))
         a = unsafe_load(Ptr{UInt64}(r.c), i)
-        if a == to_c(q)
-            from_c!(q)
-        else
-            set_element!(o, i, Core.bitcast(eltype(T), a))
-        end
+        a == c_address(q) || set_element!(o, i, Core.bitcast(eltype(T), from_c(a)))
     end
     return nothing
 end
 
-"The copy `r` of `o`, of the type `T` holding values with pointers, written back (`from_c!`)."
+"The copy `r` of `o`, of the type `T` holding values with pointers, written back (`back!`)."
 function values_from_c(@nospecialize(o), @nospecialize(r), ::Type{T}) where {T}
     o, r = o::T, r::Copy
     for i in 1:nelements(o)

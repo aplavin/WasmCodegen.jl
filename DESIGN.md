@@ -752,8 +752,12 @@ C owns.
   object). The elements of a memory or `Ref` of pointers (`Vector{String}` as `Ptr{Cstring}`,
   which Base converts to a vector of pointers, or a `Ref{Ptr{T}}` out-parameter) are passed
   each as a pointer argument is, recursively, and after the call a pointer C left as it was is
-  the pointer it was, one it changed its new address without owner; those of a memory of values
-  holding pointers are stored as in C memory. A pointer into a Julia object in a struct passed
+  the pointer it was, owner included; those of a memory of values holding pointers are stored
+  as in C memory. An address C gives back (a pointer result, a pointer it wrote: an
+  out-parameter, an element of an array of pointers it permuted) that is in a copy of the call
+  is mapped, before the copies are dropped, to the pointer into that copy's object at the same
+  offset (or one past its end); any other address is a C address. Every copy of a mutable
+  object is written back after the call, whichever pointer, if any, still points into it. A pointer into a Julia object in a struct passed
   by value is an error (a field says nothing of the object to copy, its size or its lifetime).
   The copy costs O(n) per call in the size of the object: data a program passes to C at every
   call is better kept in C memory (`Libc.malloc`), where it is passed as its address, without

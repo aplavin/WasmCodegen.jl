@@ -134,6 +134,24 @@ EXPORT void ct_get_name(int i, const char **out) { *out = ct_name(i); }
 EXPORT void ct_replace_odd(const char **ss, int n) {
     for (int i = 1; i < n; i += 2) ss[i] = ct_name(i % 4);
 }
+/* pointers C gives back into its arguments: a result, an out-parameter, a permuted array */
+EXPORT const char *ct_find(const char *s, int c) { return strchr(s, c); }
+EXPORT double *ct_find_f64(double *a, size_t n, double x) {
+    size_t i = 0;
+    while (i < n && a[i] < x) i++;
+    return a + i;                                       /* one past the end if none */
+}
+EXPORT double ct_strtod(const char *s, char **end) { return strtod(s, end); }
+EXPORT void ct_point_into(double *a, double **out, size_t i) { *out = a + i; }
+static int ct_cmp_str(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+EXPORT void ct_sort_strings(const char **ss, int n) { qsort(ss, n, sizeof *ss, ct_cmp_str); }
+/* the buffers reversed, then the first byte of each written by its new place */
+EXPORT void ct_reverse_mark(unsigned char **bufs, int n) {
+    for (int i = 0; i < n / 2; i++) { unsigned char *t = bufs[i]; bufs[i] = bufs[n - 1 - i]; bufs[n - 1 - i] = t; }
+    for (int i = 0; i < n; i++) bufs[i][0] = (unsigned char)('A' + i);
+}
 /* write into a buffer */
 EXPORT int ct_format(char *buf, size_t n, int x, double y) { return snprintf(buf, n, "x=%d y=%.3f", x, y); }
 

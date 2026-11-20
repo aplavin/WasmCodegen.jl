@@ -531,6 +531,46 @@ function ct_stack_after_error(n::Int)
     return (ok, ccall((:emscripten_stack_get_current, libctest), UInt64, ()) == sp)
 end
 
+# pointers C gives back into the copies of its arguments are pointers into the objects (the
+# differential results show the copies only where C returns, writes or compares pointers: these)
+function ct_back_pointers(i::Int)
+    s = ("hello, world", "xyz", "")[i]
+    p = ccall((:ct_find, libctest), Ptr{UInt8}, (Cstring, Cint), s, Cint('o'))
+    found = p == C_NULL ? (-1, sdigest("")) : GC.@preserve s (Int(p - pointer(s)), sdigest(unsafe_string(p)))
+    v = [1.5, 2.5, 3.5, 4.5]
+    q = ccall((:ct_find_f64, libctest), Ptr{Float64}, (Ptr{Float64}, Csize_t, Float64), v, 4, 3.0)
+    off = GC.@preserve v (unsafe_store!(q, -1.0); Int(q - pointer(v)))       # a store into `v`
+    e = ccall((:ct_find_f64, libctest), Ptr{Float64}, (Ptr{Float64}, Csize_t, Float64), v, 4, 99.0)
+    endoff = GC.@preserve v Int(e - pointer(v))                                # one past its end
+    # an out-parameter set into another argument (strtod's `endptr`)
+    t = "  -12.5e1xyz"
+    endp = Ref{Ptr{UInt8}}(C_NULL)
+    x = ccall((:ct_strtod, libctest), Float64, (Cstring, Ref{Ptr{UInt8}}), t, endp)
+    rest = GC.@preserve t (Int(endp[] - pointer(t)), sdigest(unsafe_string(endp[])))
+    w = zeros(5)
+    out = Ref{Ptr{Float64}}(C_NULL)
+    ccall((:ct_point_into, libctest), Cvoid, (Ptr{Float64}, Ref{Ptr{Float64}}, Csize_t), w, out, 3)
+    GC.@preserve w unsafe_store!(out[], 7.0)
+    return (found, off, vdigest(v), endoff, x, rest, vdigest(w))
+end
+# C permutes an array of pointers: each element still points into its object
+function ct_sorted(n::Int)
+    strs = ["pear", "apple", "fig", "banana", "cherry", "date"][1:n]
+    ptrs = [pointer(s) for s in strs]
+    GC.@preserve strs ccall((:ct_sort_strings, libctest), Cvoid, (Ptr{Ptr{UInt8}}, Cint), ptrs, n)
+    idx = GC.@preserve strs [findfirst(s -> pointer(s) == p, strs) for p in ptrs]
+    sorted = GC.@preserve strs join([unsafe_string(p) for p in ptrs], ",")
+    return (sdigest(sorted), vdigest(Float64.(idx)))
+end
+# and writes the objects through the permuted pointers: each written back
+function ct_marked(n::Int)
+    bufs = [fill(UInt8('a' + i), 3) for i in 1:n]
+    ptrs = [pointer(b) for b in bufs]
+    GC.@preserve bufs ccall((:ct_reverse_mark, libctest), Cvoid, (Ptr{Ptr{UInt8}}, Cint), ptrs, n)
+    idx = GC.@preserve bufs [findfirst(b -> pointer(b) == p, bufs) for p in ptrs]
+    return (sdigest(join([String(copy(b)) for b in bufs], ",")), vdigest(Float64.(idx)))
+end
+
 @testset "C linkage: pointers into Julia objects" begin
     if HAS_C_TOOLCHAIN
         @ctest ct_refs(Int8(-3), 0x1234, Int32(77), Int64(-9), 1.5f0, 3.25, false)
@@ -544,6 +584,12 @@ end
         @ctest ct_string_arrays(5)
         @ctest ct_buffer(Int32(-42), 3.14159)
         @ctest ct_out_block(6)
+        @ctest ct_back_pointers(1)
+        @ctest ct_back_pointers(2)
+        @ctest ct_back_pointers(3)
+        @ctest ct_sorted(6)
+        @ctest ct_marked(5)
+        @ctest ct_marked(4)
         @test crun(ct_pass_references, 3)[1] === :trap
         @test occursin(WasmCodegen.Runtime.CLink.NOT_ADDRESSABLE, LAST_OUTPUT[])
         @test crun(ct_realloc_owned, 3)[1] === :trap
