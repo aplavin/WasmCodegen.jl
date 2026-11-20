@@ -234,6 +234,19 @@ EXPORT double ct_specs_sum(ct_spec *ss, int m) {
 typedef struct { double *p; } ct_ptrbox;
 EXPORT ct_ptrbox ct_ptrbox_next(ct_ptrbox b) { b.p[0] += 1; b.p += 1; return b; }
 
+/* a struct aligned to 16 (an __int128), by value, by pointer and in an array: each where its
+ * alignment says (emscripten's malloc aligns only to 8) */
+typedef struct { unsigned __int128 a; double b; } ct_wide;     /* 32 bytes, aligned to 16 */
+EXPORT int ct_wide_check(ct_wide w, const ct_wide *p, const ct_wide *arr, int n) {
+    int bad = ((uintptr_t)&w % _Alignof(ct_wide)) != 0;
+    bad |= (((uintptr_t)p % _Alignof(ct_wide)) != 0) << 1;
+    for (int i = 0; i < n; i++) bad |= (((uintptr_t)&arr[i] % _Alignof(ct_wide)) != 0) << 2;
+    double s = 0;
+    for (int i = 0; i < n; i++) s += (double)(arr[i].a >> 64) + arr[i].b;
+    return bad * 1000000 + (int)s * 10 + (w.a == p->a && w.b == p->b);
+}
+EXPORT size_t ct_wide_layout(void) { return _Alignof(ct_wide) * 100 + sizeof(ct_wide); }
+
 /* C's own data, read and written by Julia through pointers: an IO-like struct (as ImGuiIO) */
 typedef struct {
     int32_t frame;      /* 0 */

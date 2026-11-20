@@ -774,7 +774,10 @@ C owns.
   stack's, allocated by the C module's exports (`CLinkage(stack_save, stack_alloc,
   stack_restore)`, emscripten's `emscripten_stack_get_current`, `_emscripten_stack_alloc`,
   `_emscripten_stack_restore`), up to `stack_limit` bytes per call (16 KiB of emscripten's
-  64 KiB), and the C heap's beyond (`malloc`, `free`). It is released when the call returns,
+  64 KiB), and the C heap's beyond (`malloc`, `free`), each piece aligned as its type is (any
+  power of two: the stack's allocations are aligned to 16, emscripten's `malloc` only to 8, so a
+  block for a 16-aligned `Int128` struct is taken larger and its address rounded up). It is
+  released when the call returns,
   and when a Julia exception leaves it (a `try_table` catching every exception releases it and
   throws the exception on): an error of a copy, or later of a C function's callback. A trap
   (in a module where nothing catches, a Julia exception is one) unwinds to the host without

@@ -256,22 +256,27 @@ end
 """
     scratch(n, align) -> address
 
-`n` bytes of the C module's memory for the call being made, aligned to `align` (at most 16):
-on the C stack while the call has used less than `stack_limit()` bytes of it, else a block of
-the C heap.
+`n` bytes of the C module's memory for the call being made, aligned to `align` (a power of
+two): on the C stack while the call has used less than `stack_limit()` bytes of it, else a
+block of the C heap. The stack's allocations are aligned to 16 (`stack_alloc`), so a larger
+alignment takes `align - 16` bytes more; a block of the heap is taken `align - 1` bytes larger
+(malloc's alignment is the C module's) and its address rounded up.
 """
 function scratch(n::Int, align::Int)
-    used = STACK_USED[] + n + 16
+    extra = max(align - 16, 0)
+    used = STACK_USED[] + n + extra + 16
     if used <= stack_limit()
         STACK_USED[] = used
-        return stack_alloc(UInt64(n))
+        return align_up(stack_alloc(UInt64(n + extra)), align)
     end
-    # (malloc's blocks are aligned to 16 or more)
-    c = malloc(UInt64(max(n, 1)))
+    c = malloc(UInt64(max(n + align - 1, 1)))
     c == 0 && throw_c_oom(UInt64(n))
     push!(BLOCKS, c)
-    return c
+    return align_up(c, align)
 end
+
+"The address `a` rounded up to a multiple of `align`, a power of two."
+align_up(a::UInt64, align::Int) = (a + UInt64(align - 1)) & ~UInt64(align - 1)
 
 ## pointers into Julia objects, passed to C
 

@@ -739,6 +739,21 @@ end
 struct CtPtrBox
     p::Ptr{Float64}
 end
+# a struct aligned to 16, by value, by `Ref` and in an array (on the C heap when large, after a
+# block of `k` bytes: emscripten's malloc aligns to 8, and a block of 32 makes the next one's
+# address 8 past a multiple of 16): C sees each at its alignment
+struct CtWide
+    a::UInt128
+    b::Float64
+end
+function ct_aligned(n::Int, k::Int)
+    w = CtWide(UInt128(3) << 64 | 5, 1.5)
+    arr = [CtWide(UInt128(i) << 64, i / 4) for i in 1:n]
+    p = Libc.malloc(k)
+    chk = ccall((:ct_wide_check, libctest), Cint, (CtWide, Ref{CtWide}, Ptr{CtWide}, Cint), w, Ref(w), arr, n)
+    Libc.free(p)
+    return (chk, ccall((:ct_wide_layout, libctest), Csize_t, ()), sizeof(CtWide), Base.datatype_alignment(CtWide))
+end
 function ct_specs(n::Int)
     xs = Float32[i / 2 for i in 1:n]
     ys = zeros(n)
@@ -777,6 +792,9 @@ end
         @ctest ct_io_reset()
         @ctest ct_named_owned(2)
         @ctest ct_specs(6)
+        @ctest ct_aligned(3, 32)
+        @ctest ct_aligned(600, 32)
+        @ctest ct_aligned(600, 40)
         # (the Wasm types the C ABI gives: ImVec2 by the address of a copy, a result by sret, a
         # struct of one float as a float, an empty struct dropped)
         c = ccompile(ct_structs, (Float32, Float64))
