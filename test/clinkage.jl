@@ -571,6 +571,39 @@ function ct_marked(n::Int)
     return (sdigest(join([String(copy(b)) for b in bufs], ",")), vdigest(Float64.(idx)))
 end
 
+# a mutable struct of pointers, by a pointer to it: its pointers passed as pointer arguments
+# are, those C does not change kept (with their owners), those it changes mapped back
+mutable struct CtHolder
+    name::Ptr{Cchar}
+    data::Ptr{Float64}
+    n::Cint
+end
+function ct_holders(n::Int)
+    s = "julia"
+    v = collect(1.0:n)
+    h = GC.@preserve s v CtHolder(pointer(s), pointer(v), n)
+    GC.@preserve s v h begin
+        t = ccall((:ct_holder_sum, libctest), Float64, (Ref{CtHolder},), h)
+        kept = (h.name == pointer(s), h.data == pointer(v), sdigest(unsafe_string(h.name)), h.n)
+        ccall((:ct_holder_advance, libctest), Cvoid, (Ptr{CtHolder},), pointer_from_objref(h))
+        moved = (Int(h.data - pointer(v)), unsafe_load(h.data), h.n)
+        ccall((:ct_holder_rename, libctest), Cvoid, (Ref{CtHolder},), h)
+        renamed = sdigest(unsafe_string(h.name))
+    end
+    return (t, kept, moved, renamed, vdigest(v))
+end
+# a mutable object holding references cannot be copied for C (its references would be zeros):
+# an error when compiling, where the pointer's object is known, else when running
+mutable struct CtWithRef
+    x::Float64
+    s::String
+end
+ct_ref_fields(x::Float64) = (o = CtWithRef(x, "a");
+    GC.@preserve o ccall((:ct_bump_f64, libctest), Cvoid, (Ptr{CtWithRef},), pointer_from_objref(o)); o.x)
+@noinline ct_object_ptr(o) = Ptr{Float64}(pointer_from_objref(o))
+ct_ref_fields_dynamic(x::Float64) = (o = CtWithRef(x, "a");
+    GC.@preserve o ccall((:ct_bump_f64, libctest), Cvoid, (Ptr{Float64},), ct_object_ptr(o)); o.x)
+
 @testset "C linkage: pointers into Julia objects" begin
     if HAS_C_TOOLCHAIN
         @ctest ct_refs(Int8(-3), 0x1234, Int32(77), Int64(-9), 1.5f0, 3.25, false)
@@ -590,12 +623,19 @@ end
         @ctest ct_sorted(6)
         @ctest ct_marked(5)
         @ctest ct_marked(4)
+        @ctest ct_holders(4)
+        @test ct_ref_fields_dynamic(2.0) == 1.0
+        @test crun(ct_ref_fields_dynamic, 2.0)[1] === :trap
+        @test occursin(WasmCodegen.Runtime.CLink.NOT_ADDRESSABLE, LAST_OUTPUT[])
         @test crun(ct_pass_references, 3)[1] === :trap
         @test occursin(WasmCodegen.Runtime.CLink.NOT_ADDRESSABLE, LAST_OUTPUT[])
         @test crun(ct_realloc_owned, 3)[1] === :trap
         @test occursin(WasmCodegen.Runtime.CLink.REALLOC_OWNED, LAST_OUTPUT[])
         @test crun(ct_stack_after_error, 3) == (true, true)
+        @test ct_ref_fields(2.0) == 1.0
     end
+    msg = ct_unsupported(ct_ref_fields, (Float64,))
+    @test msg isa String && occursin("a pointer to a CtWithRef, whose fields are not all isbits", msg)
 end
 
 ## structs by value: in registers when they hold one scalar, else by the address of a copy;

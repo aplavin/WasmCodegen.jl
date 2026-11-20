@@ -152,6 +152,17 @@ EXPORT void ct_reverse_mark(unsigned char **bufs, int n) {
     for (int i = 0; i < n / 2; i++) { unsigned char *t = bufs[i]; bufs[i] = bufs[n - 1 - i]; bufs[n - 1 - i] = t; }
     for (int i = 0; i < n; i++) bufs[i][0] = (unsigned char)('A' + i);
 }
+/* a struct of Julia's (a mutable struct) by a pointer to it, whose fields are pointers */
+typedef struct { const char *name; double *data; int n; } ct_holder;
+EXPORT double ct_holder_sum(ct_holder *h) {
+    double s = 0;
+    for (int i = 0; i < h->n; i++) s += h->data[i];
+    h->data[0] = s;
+    h->n = (int)strlen(h->name);
+    return s;
+}
+EXPORT void ct_holder_advance(ct_holder *h) { h->data += 1; h->n -= 1; }
+EXPORT void ct_holder_rename(ct_holder *h) { h->name = ct_name(1); }
 /* write into a buffer */
 EXPORT int ct_format(char *buf, size_t n, int x, double y) { return snprintf(buf, n, "x=%d y=%.3f", x, y); }
 

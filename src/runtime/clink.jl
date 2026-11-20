@@ -58,6 +58,21 @@ elements of its array.
 copy_elements(@nospecialize(o), off::Int, c::UInt64, n::Int, back::Bool) =
     ccall((:copy_elements, LIBRARY), Bool, (Any, Int, UInt64, Int, Bool), o, off, c, n, back)
 
+"""
+    store_fields(c, o)
+
+The isbits fields of the mutable object `o` at `c` in the C module's memory, as C lays them
+out, each pointer in them as the address `to_c` gives it.
+"""
+store_fields(c::UInt64, @nospecialize(o)) = ccall((:store_fields, LIBRARY), Cvoid, (UInt64, Any), c, o)
+"""
+    load_fields(c, o)
+
+The fields of the mutable object `o` set from the C module's memory at `c` (`store_fields`), each
+pointer in them as `back_pointer` gives it: as it was, owner included, if C did not change it.
+"""
+load_fields(c::UInt64, @nospecialize(o)) = ccall((:load_fields, LIBRARY), Cvoid, (UInt64, Any), c, o)
+
 ## Libc's allocator: the C module's
 
 "`Libc.malloc(n)`: `n` bytes of the C heap, a pointer without owner."
@@ -95,7 +110,8 @@ const OWNED_FIELD = string(
     "field says nothing of the object's size or lifetime; keep its data in C memory, Libc.malloc)")
 const NOT_ADDRESSABLE = string(
     "a pointer into a Julia object whose bytes are not laid out as natively (a memory of ",
-    "references, or of elements holding references) passed to a C function")
+    "references or of elements holding references, a mutable object with fields that are not ",
+    "isbits: references, unions) passed to a C function: C cannot be given a copy of it")
 const REALLOC_OWNED = "Libc.realloc of a pointer into a Julia object, not a block of the C module's heap"
 
 @noinline throw_owned_store() = c_error(OWNED_STORE)
@@ -115,9 +131,10 @@ end
 The copy of the object `owner` at `c` in the C module's memory, `n` bytes, for the call being
 made; `base` is the pointer to the owner's first byte (its address and the owner), from which
 an address in the copy is mapped back to a pointer into the owner (`from_c`). `kind`: `:bytes`
-(its bytes), `:pointers` (a memory or `Ref` of pointers: the address standing for each pointer)
-or `:values` (a memory or `Ref` of isbits values holding pointers, stored as C stores them).
-Written back after the call if `writeback` (a mutable owner).
+(its bytes), `:pointers` (a memory or `Ref` of pointers: the address standing for each pointer),
+`:values` (a memory or `Ref` of isbits values holding pointers, stored as C stores them) or
+`:fields` (a mutable object of isbits fields holding pointers: its fields, each pointer as a
+pointer argument is passed). Written back after the call if `writeback` (a mutable owner).
 """
 mutable struct Copy
     owner::Any
@@ -158,6 +175,8 @@ changed are mapped back (`from_c`), all copies being alive until `leave`.
             Runtime.by_type(pointers_from_c, r.owner, r)
         elseif r.kind === :values
             Runtime.by_type(values_from_c, r.owner, r)
+        elseif r.kind === :fields
+            Runtime.by_type(fields_from_c, r.owner, r)
         else
             copy_bytes!(r.owner, r.c, Ptr{UInt8}(r.base), r.n, true)
         end
@@ -220,6 +239,13 @@ holds(holds::F, @nospecialize(T)) where {F} =
     T isa DataType && (T <: Memory || T <: Base.RefValue) && isconcretetype(T) && holds(eltype(T))
 holds_pointers(@nospecialize(T)) = holds(is_pointer_type, T)
 holds_values(@nospecialize(T)) = holds(E -> isbitstype(E) && has_pointers(E) && !is_pointer_type(E), T)
+"""
+Whether the objects of type `T` are mutable objects (not memories or `Ref`s) whose fields are
+isbits values, some holding pointers: copied field by field (`fields_to_c`).
+"""
+holds_fields(@nospecialize(T)) =
+    T isa DataType && isconcretetype(T) && ismutabletype(T) && !(T <: Memory) && !(T <: Base.RefValue) &&
+    fieldcount(T) > 0 && all(isbitstype, fieldtypes(T)) && any(has_pointers, fieldtypes(T))
 
 # the copy of the call whose owner is `o`, or 0
 function find_copy(@nospecialize(o))
@@ -301,7 +327,8 @@ back_pointer(a::UInt64, old::Ptr{Cvoid}) = a == c_address(old) ? old : from_c(a)
 function copy_owner!(@nospecialize(o), base::Ptr{Cvoid})
     # (the copy is pushed first, those of the objects its pointers point into after it)
     k = length(COPIES) + 1
-    (Runtime.by_type(pointers_to_c, o, base) || Runtime.by_type(values_to_c, o, base)) && return k
+    (Runtime.by_type(pointers_to_c, o, base) || Runtime.by_type(values_to_c, o, base) ||
+     Runtime.by_type(fields_to_c, o, base)) && return k
     n = owner_nbytes(o)
     n < 0 && throw_not_addressable()
     immutable = o isa String || o isa Symbol
@@ -342,6 +369,23 @@ function values_to_c(@nospecialize(o), @nospecialize(b), ::Type{T}) where {T}
     push!(COPIES, Copy(o, b::Ptr{Cvoid}, c, n * Base.aligned_sizeof(E), :values, true))
     return nothing
 end
+
+"""
+The copy of `o`, a mutable object of type `T` whose fields are isbits values holding pointers
+(`c_fields_owner`), whose base pointer is `b` (`copy_owner!`): its fields as C holds them, each
+pointer in them as a pointer argument is passed (`store_fields`).
+"""
+function fields_to_c(@nospecialize(o), @nospecialize(b), ::Type{T}) where {T}
+    o = o::T
+    c = scratch(sizeof(T), Base.datatype_alignment(T))
+    # (the copy first: a pointer among them to the object itself is to the copy)
+    push!(COPIES, Copy(o, b::Ptr{Cvoid}, c, sizeof(T), :fields, true))
+    store_fields(c, o)
+    return nothing
+end
+
+"The copy `r` of `o`, of the type `T` (`fields_to_c`), written back (`back!`, `load_fields`)."
+fields_from_c(@nospecialize(o), @nospecialize(r), ::Type{T}) where {T} = load_fields((r::Copy).c, o::T)
 
 # copy the `n` bytes of the owner `o` from its base pointer `p` to the C module's memory at `c`,
 # or back (`back`)

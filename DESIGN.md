@@ -753,7 +753,11 @@ C owns.
   which Base converts to a vector of pointers, or a `Ref{Ptr{T}}` out-parameter) are passed
   each as a pointer argument is, recursively, and after the call a pointer C left as it was is
   the pointer it was, owner included; those of a memory of values holding pointers are stored
-  as in C memory. An address C gives back (a pointer result, a pointer it wrote: an
+  as in C memory. The pointer fields of a mutable struct passed by pointer (`Ref` of it,
+  `pointer_from_objref`) are passed as pointer arguments are, and come back the same way. A
+  mutable object with fields that are not isbits (references, inline unions) cannot be given to
+  C as a copy: an unsupported construct where the pointer's object is known when compiling, else
+  an error when the call is made. An address C gives back (a pointer result, a pointer it wrote: an
   out-parameter, an element of an array of pointers it permuted) that is in a copy of the call
   is mapped, before the copies are dropped, to the pointer into that copy's object at the same
   offset (or one past its end); any other address is a C address. Every copy of a mutable

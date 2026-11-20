@@ -173,6 +173,13 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
     for (k, (v, T, a)) in enumerate(zip(vals, ATs, aabis))
         a.kind === :pointer && !is_ptr_type(v.typ) &&
             unsupported("a ", v.typ, " as the argument ", k, " (declared ", T, ") of a ccall of ", what...)
+        # (a pointer to a mutable object known here, which C cannot be given a copy of: its
+        # fields hold references, or inline unions)
+        o = a.kind === :pointer ? v.origin : nothing
+        if o !== nothing && is_object_origin(o) && !all(isbitstype, fieldtypes(o.eltype))
+            unsupported("a pointer to a ", o.eltype, ", whose fields are not all isbits (references, unions), ",
+                        "as the argument ", k, " of a ccall of ", what..., ": C cannot be given a copy of it")
+        end
     end
     variadic = nreq > 0
     fixed = variadic ? (1:nreq) : eachindex(ATs)
@@ -208,7 +215,7 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
         elseif a.kind === :indirect
             c = c_scratch!(fc, sizeof(T), Base.datatype_alignment(T))
             c_store!(fc, c_pointer(fc, c, T), convert_repr(fc, v, T), const_value(fc, 1);
-                     err=Runtime.CLink.throw_owned_field)
+                     owned=Runtime.CLink.throw_owned_field)
             push!(params, I64); push!(pushes, c)
         end
     end
@@ -270,10 +277,22 @@ function c_scratch!(fc::FnCtx, n::Integer, align::Integer)
 end
 
 """
-The address standing for the pointer argument `p` in the C module's memory: its own without an
-owner, else that of the copy of its owner made for the call (`Runtime.CLink.to_c`). A local.
+    CallFrame(loc)
+
+Where the copies a call into the C module makes of the objects its pointers point into belong:
+the call's frame, open (`loc === nothing`: in `Runtime.CLink`'s code, which a call's frame runs).
 """
-function c_pointer_address!(fc::FnCtx, p::CGVal)
+struct CallFrame
+    loc::Union{Nothing,Int}
+end
+
+"""
+The address standing for the pointer argument `p` in the C module's memory: its own without an
+owner, else that of the copy of its owner made for the call (`Runtime.CLink.to_c`), in the
+frame `frame`. A leaf.
+"""
+function c_pointer_address!(fc::FnCtx, p::CGVal, frame::CallFrame=CallFrame(nothing))
+    ownerless(p) && return p.leaves[1]
     a = new_local!(fc, I64)
     push_leaf!(fc, ptr_owner(p)); emit!(fc.b, :ref_is_null)
     if!(fc.b, I64)
@@ -283,6 +302,21 @@ function c_pointer_address!(fc::FnCtx, p::CGVal)
     end!(fc.b)
     emit!(fc.b, :local_set, a)
     return a
+end
+
+"""
+The pointer that the address C left in the leaf `a` (a result, a value in a copy) stands for
+after the call, in the frame `frame`: `Runtime.CLink.back_pointer` of the pointer `old` (its two
+leaves) passed there before the call, or `Runtime.CLink.from_c`.
+"""
+function c_back_pointer!(fc::FnCtx, a::LeafVal, frame::CallFrame, old)
+    av = CGVal(UInt64, Inline, LeafVal[a])
+    r = if old !== nothing
+        call_runtime!(fc, Runtime.CLink.back_pointer, CGVal[av, CGVal(Ptr{Cvoid}, Inline, LeafVal[old...])])
+    else
+        call_runtime!(fc, Runtime.CLink.from_c, CGVal[av])
+    end
+    return convert_repr(fc, r, Ptr{Cvoid})
 end
 
 # push the scalar `P` the argument `v` of the declared type `T` is or holds, as the C ABI
@@ -434,6 +468,29 @@ function emit_clink_primitive!(fc::FnCtx, @nospecialize(name), args::Vector{Any}
         foreach(v -> push_val!(fc, v), vals)
         emit!(fc.b, name === :memmove ? :memory_copy : :memory_fill, (name === :memmove ? (0, 0) : (0,))...)
         return ghost(Nothing, nothing)
+    elseif name === :store_fields || name === :load_fields
+        # (in a copy of the call's frame: `Runtime.CLink.fields_to_c`, `fields_from_c`)
+        o = vals[2]
+        T = o.typ
+        (T isa DataType && ismutabletype(T) && all(isbitstype, fieldtypes(T))) ||
+            unsupported("the fields of a ", T, " in the C module's memory")
+        c = new_local!(fc, I64)
+        push_val!(fc, vals[1]); emit!(fc.b, :local_set, c)
+        for i in 1:fieldcount(T)
+            FT = fieldtype(T, i)
+            sizeof(FT) == 0 && continue
+            a = new_local!(fc, I64)
+            emit!(fc.b, :local_get, c); emit!(fc.b, :i64_const, Int(fieldoffset(T, i))); emit!(fc.b, :i64_add)
+            emit!(fc.b, :local_set, a)
+            p = c_pointer(fc, a, FT)
+            if name === :store_fields
+                c_store!(fc, p, get_field(fc, o, i), const_value(fc, 1); owned=CallFrame(nothing))
+            else
+                old = get_field(fc, o, i)
+                set_field!(fc, o, i, c_load!(fc, p, const_value(fc, 1), FT; frame=CallFrame(nothing), old))
+            end
+        end
+        return ghost(Nothing, nothing)
     elseif name === :owner_nbytes || name === :copy_elements
         foreach(v -> push_val!(fc, v), vals)
         call!(fc.b, c_helper!(cgm, name))
@@ -503,6 +560,8 @@ function finish_owner_nbytes!(cgm::CGModule, f::Func)
         end!(b)
     end
     for (id, _, _) in object_owners(cgm)
+        # (of isbits fields only: a reference, an inline union, cannot be copied for C)
+        all(isbitstype, fieldtypes(ts.typelist[id])) || continue
         push_tid_in!(b, tid, (id,))
         if!(b)
         emit!(b, :i64_const, sizeof(cgm.types.typelist[id])); return!(b)

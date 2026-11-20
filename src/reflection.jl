@@ -563,7 +563,9 @@ const BY_TYPE_CASES = IdDict{Any,Function}(
     Runtime.CLink.pointers_to_c => (world, @nospecialize(T)) -> Runtime.CLink.holds_pointers(T),
     Runtime.CLink.pointers_from_c => (world, @nospecialize(T)) -> Runtime.CLink.holds_pointers(T),
     Runtime.CLink.values_to_c => (world, @nospecialize(T)) -> Runtime.CLink.holds_values(T),
-    Runtime.CLink.values_from_c => (world, @nospecialize(T)) -> Runtime.CLink.holds_values(T))
+    Runtime.CLink.values_from_c => (world, @nospecialize(T)) -> Runtime.CLink.holds_values(T),
+    Runtime.CLink.fields_to_c => (world, @nospecialize(T)) -> Runtime.CLink.holds_fields(T),
+    Runtime.CLink.fields_from_c => (world, @nospecialize(T)) -> Runtime.CLink.holds_fields(T))
 
 # whether `showerror(::IOBuffer, ::T)` is trim-safe in `world` (once per type, for the world
 # last asked about: the answers of another world are dropped)

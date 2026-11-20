@@ -785,19 +785,29 @@ function c_access_op(t::ValType, n::Int, store::Bool)
 end
 
 """
-    c_load!(fc, p, i, T) -> CGVal
+    c_load!(fc, p, i, T; frame, old) -> CGVal
 
 `unsafe_load(p, i)` of a pointer without owner: the value of the isbits type `T` at its address
 in the C module's memory, each primitive leaf one load, little-endian as Julia lays it out; a
-pointer in it has no owner.
+pointer in it has no owner. In a call's frame (`frame`, a `CallFrame`: the value C left in a
+copy), a pointer in it is the one its address stands for (`Runtime.CLink.from_c`), or, where it
+is the value `old` was before the call and C left it as it was, `old`'s
+(`Runtime.CLink.back_pointer`).
 """
-function c_load!(fc::FnCtx, p::CGVal, i::CGVal, @nospecialize(T))
+function c_load!(fc::FnCtx, p::CGVal, i::CGVal, @nospecialize(T); frame=nothing, old=nothing)
     c_memory!(fc.cgm)
     _, a = byte_offset!(fc, p, i, T)
+    oldl = old === nothing ? nothing : convert_repr(fc, old, T).leaves
     leaves = LeafVal[]
-    for (P, off) in bit_leaves(T)
+    for (j, (P, off)) in enumerate(bit_leaves(T))
         if P === :owner
-            push!(leaves, Inst(:ref_null, fc.cgm.types.jlvalue))
+            if frame === nothing
+                push!(leaves, Inst(:ref_null, fc.cgm.types.jlvalue))
+            else
+                addr = pop!(leaves)
+                q = c_back_pointer!(fc, addr, frame::CallFrame, oldl === nothing ? nothing : oldl[j-1:j])
+                append!(leaves, q.leaves)
+            end
             continue
         end
         t, n = prim_wtype(fc, P), nbytes(P)
@@ -814,18 +824,26 @@ function c_load!(fc::FnCtx, p::CGVal, i::CGVal, @nospecialize(T))
 end
 
 """
-    c_store!(fc, p, v, i; err) -> CGVal
+    c_store!(fc, p, v, i; owned) -> CGVal
 
 `unsafe_store!(p, v, i)` of a pointer without owner: the bytes of `v` at its address in the C
 module's memory. A pointer into a Julia object in `v` cannot be meaningful there (the C module
-cannot address the object): `err` (a runtime function) is thrown, before any byte is stored.
+cannot address the object): `owned` (a runtime function) is thrown, before any byte is stored;
+or, where `owned` is a call's frame (`CallFrame`: `v` is passed to C), the pointer is stored as
+the address of the copy of its object made for the call (`c_pointer_address!`).
 """
-function c_store!(fc::FnCtx, p::CGVal, v::CGVal, i::CGVal; err=Runtime.CLink.throw_owned_store)
+function c_store!(fc::FnCtx, p::CGVal, v::CGVal, i::CGVal; owned=Runtime.CLink.throw_owned_store)
     T = v.typ
     c_memory!(fc.cgm)
     ls = collect(bits_value_leaves(fc, v, T))
-    for ((P, _), leaf) in ls
-        P === :owner && check_ownerless!(fc, leaf, err)
+    for (j, ((P, _), leaf)) in enumerate(ls)
+        P === :owner || continue
+        if owned isa CallFrame
+            (Pa, addr) = ls[j-1]
+            ls[j-1] = (Pa, c_pointer_address!(fc, CGVal(Ptr{Cvoid}, Inline, LeafVal[addr, leaf]), owned))
+        else
+            check_ownerless!(fc, leaf, owned)
+        end
     end
     _, a = byte_offset!(fc, p, i, T)
     for ((P, off), leaf) in ls
