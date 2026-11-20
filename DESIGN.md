@@ -732,7 +732,9 @@ C owns.
   libraries are resolved as before (constant strings only), so nothing changes. Only `host =
   :js`: WASI's calls pass data in a memory of the module's own, at offsets of its own, as do the
   byte arguments of `import_libraries`' imports (an unsupported construct with a C module); none
-  may write the C module's memory.
+  may write the C module's memory. For the same reason a C module cannot be combined with
+  `tasks = :jspi` or `host_extensions = [:julia_io]`, which need WASI's host (an
+  `ArgumentError` says so).
 - **Pointers without owner are C addresses** (`pointers.jl`). The null owner of a pointer made
   from an integer (section 5) is the C module's memory, as natively: a load or store through
   one is the memory's instruction for each primitive leaf (little-endian, as Julia lays out

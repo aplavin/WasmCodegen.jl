@@ -28,12 +28,15 @@ The linkage of a module with one C module compiled to Wasm (`Config(c_linkage)`,
   (exported with `-sEXPORTED_FUNCTIONS=...,_emscripten_stack_get_current,__emscripten_stack_alloc,__emscripten_stack_restore`);
 - `malloc`, `free`: the C module's allocator, for that space beyond `stack_limit` bytes per call
   (so that copies of large arrays cannot overflow the C stack), and for `Libc.malloc`,
-  `Libc.free` (and `Libc.calloc`, `Libc.realloc`, imported by their own names);
-- `stack_limit`: the bytes of the C stack one call may use for its space (16 KiB; emscripten's
-  stack is 64 KiB by default);
-- `memory64`: must be `true`: only C modules with a 64-bit memory are supported (their
-  pointers, `size_t` and `long` are 8 bytes, as Julia's on 64-bit platforms, so that structs
-  are laid out as natively).
+  `Libc.free`; `calloc`, `realloc`: its exports for `Libc.calloc`, `Libc.realloc` (imported only
+  by a program that calls them);
+- `stack_limit`: the bytes of the C stack one call may use for its copies (16 KiB; emscripten's
+  stack is 64 KiB by default).
+
+The C module is a 64-bit one (memory64): a 32-bit C module is not supported. The import module
+`import_module` must not be empty, one of WasmCodegen's own (`julia`, ...), or a library of
+`import_libraries`; a module linked with a C module is for `host = :js`, without `tasks` or
+`host_extensions` (which need WASI's host and a memory of the module's own).
 """
 Base.@kwdef struct CLinkage
     libraries::Vector{Union{String,Symbol,Base.Libc.Libdl.LazyLibrary}}
@@ -44,8 +47,9 @@ Base.@kwdef struct CLinkage
     stack_restore::String = "_emscripten_stack_restore"
     malloc::String = "malloc"
     free::String = "free"
+    calloc::String = "calloc"
+    realloc::String = "realloc"
     stack_limit::Int = 16384
-    memory64::Bool = true
 end
 
 """

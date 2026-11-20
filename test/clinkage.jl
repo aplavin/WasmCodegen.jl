@@ -444,10 +444,28 @@ end
     c = ccompile(ct_count_more, ())
     @test any(f -> f.imported == ("c", "ct_count"), c.cgm.mod.funcs)
     # configurations
-    @test_throws ArgumentError WasmCodegen.compile(ct_count_more, (); config=WasmCodegen.Config(host=:wasi, c_linkage=CLinkage(libraries=[libctest])))
-    @test_throws ArgumentError WasmCodegen.compile(ct_count_more, (); config=ctest_config(memory64=false))
-    @test_throws ArgumentError WasmCodegen.compile(ct_count_more, (); config=test_config(import_libraries=[libctest], c_linkage=CLinkage(libraries=[libctest])))
-    @test_throws ArgumentError WasmCodegen.compile(ct_count_more, (); config=ctest_config(import_module="julia"))
+    cfg(; kw...) = test_config(; c_linkage=CLinkage(libraries=[libctest]), kw...)
+    for (config, msg) in [(WasmCodegen.Config(host=:wasi, c_linkage=CLinkage(libraries=[libctest])), "with host = :wasi"),
+                          (cfg(host=:wasi, host_extensions=[:julia_io], tasks=:jspi), "cannot be combined with tasks = :jspi"),
+                          (cfg(host=:wasi, host_extensions=[:julia_io]), "cannot be combined with host_extensions"),
+                          (cfg(import_libraries=[libctest]), "is also a library of host imports"),
+                          (cfg(foreign_functions=[(:f, libctest) => identity]), "is also a library of foreign_functions"),
+                          (test_config(c_linkage=CLinkage(libraries=String[])), "no libraries"),
+                          (test_config(c_linkage=CLinkage(libraries=[""])), "an empty library name"),
+                          (test_config(c_linkage=CLinkage(libraries=["julia_io"])), "is a name of WasmCodegen's own imports"),
+                          (ctest_config(stack_limit=-1), "a negative stack_limit"),
+                          (ctest_config(import_module="julia"), "is a module of WasmCodegen's own imports"),
+                          (ctest_config(import_module=""), "an empty import_module"),
+                          (test_config(import_libraries=["c"], c_linkage=CLinkage(libraries=[libctest])),
+                           "the import_module \"c\" is also a library of host imports")]
+        @test_throws msg WasmCodegen.check_c_linkage(config)
+    end
+    # (a Symbol identity is not a String's: no clash with import_libraries' names)
+    @test WasmCodegen.check_c_linkage(test_config(import_libraries=["libq"], c_linkage=CLinkage(libraries=[:libq]))) === nothing
+    # the allocator's exports, by the configured names
+    c = WasmCodegen.compile(ct_heap, (Int,); config=ctest_config(malloc="my_malloc", free="my_free", calloc="my_calloc", realloc="my_realloc"))
+    @test issubset([("c", "my_malloc"), ("c", "my_free"), ("c", "my_calloc"), ("c", "my_realloc")],
+                   [f.imported for f in c.cgm.mod.funcs])
     # the build host's C types must be wasm64's (LP64)
     @test WasmCodegen.check_c_host() === nothing
     @test_throws "the C linkage needs an LP64 host" WasmCodegen.check_c_host(long=4, wchar=2)

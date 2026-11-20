@@ -47,9 +47,16 @@ function check_c_linkage(config)
     cl = config.c_linkage
     cl === nothing && return
     check_c_host()
-    cl.memory64 || throw(ArgumentError(string(
-        "Config(c_linkage): only C modules with a 64-bit memory (memory64: emscripten's -m64, ",
-        "clang's wasm64) are supported, whose pointers and size_t are 8 bytes as Julia's")))
+    # (tasks on stacks of their own and the host's events need WASI's host and a memory of the
+    # module's own, for the host's calls' data: the C module's is the module's only one)
+    config.tasks === :none || throw(ArgumentError(string(
+        "Config(c_linkage) cannot be combined with tasks = :$(config.tasks): tasks on stacks of their own ",
+        "need host = :wasi with the julia_io extension, whose calls pass data through a memory of the ",
+        "module's own, and a module linked with a C module has the C module's memory only")))
+    isempty(config.host_extensions) || throw(ArgumentError(string(
+        "Config(c_linkage) cannot be combined with host_extensions = $(config.host_extensions): the host's ",
+        "extensions are WASI's (host = :wasi), whose calls pass data through a memory of the module's own, ",
+        "and a module linked with a C module has the C module's memory only")))
     config.host === :js || throw(ArgumentError(string(
         "Config(c_linkage) with host = :$(config.host): WASI's calls pass data through a memory of ",
         "the module's own, and the C module's memory is the module's only one; use host = :js")))
@@ -66,8 +73,12 @@ function check_c_linkage(config)
         any(((_, l),) -> same_library(l, id), first.(config.foreign_functions)) &&
             throw(ArgumentError("Config(c_linkage): \"$s\" is also a library of foreign_functions"))
     end
+    isempty(cl.import_module) && throw(ArgumentError("Config(c_linkage): an empty import_module"))
     reserved_import_library(cl.import_module) &&
         throw(ArgumentError("Config(c_linkage): \"$(cl.import_module)\" is a module of WasmCodegen's own imports"))
+    cl.import_module in config.import_libraries &&
+        throw(ArgumentError("Config(c_linkage): the import_module \"$(cl.import_module)\" is also a library of host imports (import_libraries)"))
+    return nothing
 end
 
 "Whether a module compiled with `cgm` is linked with a C module (`Config(c_linkage)`)."
@@ -657,8 +668,8 @@ function emit_clink_primitive!(fc::FnCtx, @nospecialize(name), args::Vector{Any}
                stack_alloc=(cl.stack_alloc, ValType[I64], ValType[I64]),
                stack_restore=(cl.stack_restore, ValType[I64], ValType[]),
                malloc=(cl.malloc, ValType[I64], ValType[I64]), free=(cl.free, ValType[I64], ValType[]),
-               calloc=("calloc", ValType[I64, I64], ValType[I64]),
-               realloc=("realloc", ValType[I64, I64], ValType[I64]))
+               calloc=(cl.calloc, ValType[I64, I64], ValType[I64]),
+               realloc=(cl.realloc, ValType[I64, I64], ValType[I64]))
     if name in keys(imports)
         n, params, results = imports[name]
         foreach(v -> push_val!(fc, v), vals)

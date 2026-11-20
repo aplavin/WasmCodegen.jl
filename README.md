@@ -110,8 +110,10 @@ results follow the C ABI (structs by value, results by sret, varargs); a pointer
 is an address in the C module's memory (`Libc.malloc`, C's results, `unsafe_load` and
 `unsafe_store!` of C's structs), and a pointer into a Julia object (an array, a string, a `Ref`)
 is passed as the address of a copy of the object, written back after the call: O(n) per call,
-so data passed at every call is better kept in C memory. The C module provides its stack and
-allocator exports (`-sEXPORTED_FUNCTIONS=_malloc,_free,_emscripten_stack_get_current,__emscripten_stack_alloc,__emscripten_stack_restore`),
+so data passed at every call is better kept in C memory. The C module provides, besides the
+functions the program calls and its `memory`, every export the module may import: its stack's and
+its allocator's (`-sEXPORTED_FUNCTIONS=_malloc,_free,_calloc,_realloc,_emscripten_stack_get_current,__emscripten_stack_alloc,__emscripten_stack_restore`;
+`calloc` and `realloc` only for `Libc.calloc` and `Libc.realloc`; the names are `CLinkage`'s options),
 and its instance's raw exports are the import module `c` (emscripten's `Module.wasmExports`
 wraps some of a memory64 module's, so take them where it instantiates the module, e.g. in its
 `instantiateWasm`):
