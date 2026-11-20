@@ -539,6 +539,10 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
         return outlined_isassigned!(fc, args[1], args[3])
     elseif f === Core.memoryrefoffset
         r = args[1]::CGVal
+        # (a reference of a type not known at compile time, a box: unsupported, as for the other
+        # builtins of memory references, `ref_eltype`)
+        ref_eltype(r.typ)
+        r = convert_repr(fc, r, r.typ)
         push_leaf!(fc, r.leaves[3])
         emit!(fc.b, :i32_const, 1)
         emit!(fc.b, :i32_add)

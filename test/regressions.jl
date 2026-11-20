@@ -575,3 +575,29 @@ rb_muladd16(a::Float16, b::Float16, c::Float16) = muladd(a, b, c)
     end
     @test occursin("a float intrinsic on values of type", report) && occursin("BFloat16", report)
 end
+
+# `memoryrefoffset` of a reference whose type is known only at run time (here `resize!` of each
+# vector of a tuple of six vector types, inlined where the vector is a `Vector` of unknown element
+# type, as StructArrays resizes its columns): an unsupported construct, as for the other builtins of
+# memory references, and not an error of the code generator (it read the leaves of a box)
+function rb_resize_each(n::Int)
+    nt = (a=[1], b=[1.0], c=[:x], d=[1f0], e=[UInt8(1)], f=["s"])
+    foreach(v -> resize!(v, n), nt)
+    length(nt.a) + length(nt.f)
+end
+function rb_offset(n::Int)
+    v = collect(1:n)
+    (Base.memoryrefoffset(v.ref), Base.memoryrefoffset(Base.memoryref(v.ref, n)))
+end
+
+@testset "memoryrefoffset of a reference of a type not known at compile time" begin
+    @wtest rb_offset(3)
+    report = try
+        WasmCodegen.compile(rb_resize_each, (Int,); config = test_config(optimize = nothing))
+        ""
+    catch e
+        e isa WasmCodegen.UnsupportedConstructs || rethrow()
+        sprint(showerror, e)
+    end
+    @test occursin("a memory reference of a type not known at compile time", report)
+end
