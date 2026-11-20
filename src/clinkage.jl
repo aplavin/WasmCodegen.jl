@@ -16,9 +16,9 @@
 #
 # A pointer into a Julia object (with an owner) is passed as the address of a copy of its
 # owner, made for the call (`Runtime.CLink`), and copied back after it into a mutable owner.
-# The space a call needs (copies) is the C stack's (`CLinkage(stack_save, stack_alloc,
-# stack_restore)`), or the C heap's past `stack_limit` bytes, released when the call returns or
-# throws. (Not yet: structs by value but of one scalar, variadic calls.)
+# The space a call needs (copies, structs by value, results) is the C stack's
+# (`CLinkage(stack_save, stack_alloc, stack_restore)`), or the C heap's past `stack_limit` bytes,
+# released when the call returns or throws. (Not yet: variadic calls.)
 
 "The library of the primitives `Runtime.CLink` calls (`emit_clink_primitive!`)."
 const CLINK_LIBRARY = Runtime.CLink.LIBRARY
@@ -174,11 +174,10 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
         a.kind === :pointer && !is_ptr_type(v.typ) &&
             unsupported("a ", v.typ, " as the argument ", k, " (declared ", T, ") of a ccall of ", what...)
     end
-    any(a -> a.kind === :indirect, [rabi; aabis]) && unsupported("a struct by value (not yet) in a ccall of ", what...)
     nreq > 0 && unsupported("a variadic ccall (not yet) of ", what...)
     # pointers that may point into Julia objects: copied for the call, and back after it
     owned = [k for k in eachindex(ATs) if aabis[k].kind === :pointer && !ownerless(vals[k])]
-    space = !isempty(owned)
+    space = rabi.kind === :indirect || !isempty(owned) || any(a -> a.kind === :indirect, aabis)
     guarded = space && cgm.exceptions !== :none
     frame = space ? call_runtime!(fc, Runtime.CLink.enter, CGVal[]) : nothing
     if guarded
@@ -188,6 +187,10 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
         try_table!(fc.b, :empty, [(3, nothing, 0)]); open_label!(fc)
     end
     params, pushes = ValType[], LeafVal[]
+    if rabi.kind === :indirect
+        sret = c_scratch!(fc, sizeof(RT), Base.datatype_alignment(RT))
+        push!(params, I64); push!(pushes, sret)
+    end
     addrs = Dict{Int,Int}()
     for k in owned
         addrs[k] = c_pointer_address!(fc, vals[k])
@@ -201,6 +204,11 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
             push!(params, t); push!(pushes, l)
         elseif a.kind === :pointer
             push!(params, I64); push!(pushes, get(addrs, k, v.leaves[1]))
+        elseif a.kind === :indirect
+            c = c_scratch!(fc, sizeof(T), Base.datatype_alignment(T))
+            c_store!(fc, c_pointer(fc, c, T), convert_repr(fc, v, T), const_value(fc, 1);
+                     err=Runtime.CLink.throw_owned_field)
+            push!(params, I64); push!(pushes, c)
         end
     end
     results = rabi.kind === :scalar ? ValType[c_scalar_wtype(rabi.type)] :
@@ -212,6 +220,8 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
     elseif rabi.kind === :pointer
         a = new_local!(fc, I64); emit!(fc.b, :local_set, a)
         CGVal(RT, Inline, LeafVal[a, Inst(:ref_null, cgm.types.jlvalue)])
+    elseif rabi.kind === :indirect
+        c_load!(fc, c_pointer(fc, pushes[1]::Int, RT), const_value(fc, 1), RT)
     else
         RT === Cvoid || RT === Nothing ? ghost(Nothing, nothing) : ghost(RT, something(ghost_value(RT)))
     end
@@ -238,6 +248,16 @@ end
 
 # the pointer `p` as a `Ptr{Cvoid}` (its leaves)
 void_ptr(p::CGVal) = CGVal(Ptr{Cvoid}, Inline, p.leaves)
+
+"The owner-less pointer of type `Ptr{T}` at the C address in the local `a`."
+c_pointer(fc::FnCtx, a::Int, @nospecialize(T)) =
+    CGVal(Ptr{T}, Inline, LeafVal[a, Inst(:ref_null, fc.cgm.types.jlvalue)])
+
+"`n` bytes of space for the call, aligned to `align`: a local holding their address."
+function c_scratch!(fc::FnCtx, n::Integer, align::Integer)
+    r = call_runtime!(fc, Runtime.CLink.scratch, CGVal[const_value(fc, Int(n)), const_value(fc, Int(align))])
+    return materialize!(fc, r)
+end
 
 """
 The address standing for the pointer argument `p` in the C module's memory: its own without an

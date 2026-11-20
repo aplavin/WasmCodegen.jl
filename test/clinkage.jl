@@ -552,3 +552,103 @@ end
     end
 end
 
+## structs by value: in registers when they hold one scalar, else by the address of a copy;
+## results by sret (D4)
+
+struct CtVec4
+    x::Float32
+    y::Float32
+    z::Float32
+    w::Float32
+end
+struct CtComplex
+    re::Float64
+    im::Float64
+end
+struct CtOne
+    v::Float32
+end
+struct CtNestedOne
+    inner::CtOne
+end
+struct CtHandle
+    id::Int64
+end
+struct CtEmpty end
+struct CtMixed
+    a::Cchar
+    b::Float64
+    c::Cshort
+end
+struct CtBig
+    m::NTuple{6,Float64}
+    k::Int32
+end
+
+function ct_structs(x::Float32, y::Float64)
+    a, b = CtVec2(x, 2x), CtVec2(-1, 0.5f0)
+    s = ccall((:ct_vec2_add, libctest), CtVec2, (CtVec2, CtVec2), a, b)
+    k = ccall((:ct_vec2_scale, libctest), CtVec2, (CtVec2, Float32), s, 3f0)
+    d = ccall((:ct_vec2_dot, libctest), Float32, (CtVec2, CtVec2), a, k)
+    m = ccall((:ct_vec4_mix, libctest), CtVec4, (CtVec4, CtVec4, Float32), CtVec4(1, 2, 3, 4), CtVec4(x, x, x, x), 0.25f0)
+    c = ccall((:ct_cmul, libctest), CtComplex, (CtComplex, CtComplex), CtComplex(y, 1), CtComplex(2, -y))
+    o = ccall((:ct_one_twice, libctest), CtOne, (CtOne,), CtOne(x))
+    n = ccall((:ct_nested_get, libctest), Float32, (CtNestedOne,), CtNestedOne(CtOne(-x)))
+    h = ccall((:ct_handle_next, libctest), CtHandle, (CtHandle,), CtHandle(Int64(1) << 40))
+    er = ccall((:ct_empty_ret, libctest), CtEmpty, ())
+    mx = ccall((:ct_mixed_sum, libctest), Float64, (CtMixed,), CtMixed(Cchar(-3), y, Cshort(300)))
+    mm = ccall((:ct_mixed_make, libctest), CtMixed, (Cchar, Float64, Cshort), Cchar(9), y, Cshort(-2))
+    big = ccall((:ct_big_make, libctest), CtBig, (Float64, Int32), y, Int32(7))
+    bs = ccall((:ct_big_sum, libctest), Float64, (CtBig,), big)
+    # a struct by value and a pointer to one (a `Ref`, written back)
+    out = Ref(CtVec2(0, 0))
+    ccall((:ct_vec2_store, libctest), Cvoid, (CtVec2, Ref{CtVec2}), a, out)
+    return (s, k, d, m, c, o, n, h, er, mx, mm, big, bs, out[])
+end
+# an empty struct as an argument: none (natively Julia does not pass a value of no size)
+ct_empty_arg(a::Cint) = ccall((:ct_empty_arg, libctest), Cint, (Cint, CtEmpty, Cint), a, CtEmpty(), Cint(2))
+# a struct holding a pointer (and its padding): of C's string, passed and returned
+function ct_named(i::Int32)
+    s = ccall((:ct_named_make, libctest), CtNamedJ, (Cint,), i)
+    n = ccall((:ct_named_len, libctest), Csize_t, (CtNamedJ,), s)
+    return (sdigest(unsafe_string(s.name)), s.n, n)
+end
+# a pointer into a Julia object in a struct by value: an error
+function ct_named_owned(n::Int)
+    s = "julia"
+    GC.@preserve s ccall((:ct_named_len, libctest), Csize_t, (CtNamedJ,), CtNamedJ(pointer(s), Cint(n)))
+end
+# ImGui's way: a struct of C's, by a pointer to it, whose fields hold structs by value
+function ct_io_struct()
+    io = ct_io()
+    w = unsafe_load(io)
+    m = ccall((:ct_vec2_add, libctest), CtVec2, (CtVec2, CtVec2), w.display, w.mouse[2])
+    unsafe_store!(Ptr{CtVec2}(Ptr{UInt8}(io) + 8), m)
+    return (m, ct_io_digest())
+end
+
+@testset "C linkage: structs by value" begin
+    if HAS_C_TOOLCHAIN
+        @ctest ct_structs(1.5f0, -2.25)
+        @ctest ct_structs(-0.0f0, 1e300)
+        @ctest ct_named(Int32(2))
+        @test crun(ct_empty_arg, Cint(4)) === Cint(42)
+        @ctest ct_io_struct()
+        @ctest ct_io_reset()
+        @test ct_named_owned(2) == 10
+        @test crun(ct_named_owned, 2)[1] === :trap
+        @test occursin(WasmCodegen.Runtime.CLink.OWNED_FIELD, LAST_OUTPUT[])
+        # (the Wasm types the C ABI gives: ImVec2 by the address of a copy, a result by sret, a
+        # struct of one float as a float, an empty struct dropped)
+        c = ccompile(ct_structs, (Float32, Float64))
+        imp(name) = only(f for f in c.cgm.mod.funcs if f.imported == ("c", name))
+        @test (imp("ct_vec2_add").params, imp("ct_vec2_add").results) == (ValType[I64, I64, I64], ValType[])
+        @test (imp("ct_vec2_dot").params, imp("ct_vec2_dot").results) == (ValType[I64, I64], ValType[F32])
+        @test (imp("ct_one_twice").params, imp("ct_one_twice").results) == (ValType[F32], ValType[F32])
+        @test (imp("ct_handle_next").params, imp("ct_handle_next").results) == (ValType[I64], ValType[I64])
+        @test isempty(imp("ct_empty_ret").results)
+        c = ccompile(ct_empty_arg, (Cint,))
+        @test only(f for f in c.cgm.mod.funcs if f.imported == ("c", "ct_empty_arg")).params == ValType[I32, I32]
+    end
+end
+
