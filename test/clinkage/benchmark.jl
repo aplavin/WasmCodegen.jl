@@ -7,7 +7,11 @@
 #
 # - a scalar C call in a loop;
 # - a call passing a Vector{Float64} of 10^5 elements (copied to C memory and back);
-# - loads and stores through a pointer into C memory (Libc.malloc), vs the same natively.
+# - loads and stores through a pointer into C memory (Libc.malloc), vs the same natively;
+# - a call taking two small structs by value (ImVec2-like) in a loop;
+# - a call whose pointer argument may point into a Julia object (its owner is not known where
+#   the call is compiled) but is a C address when it runs;
+# - a call passing a small string (a Julia object: copied for each call).
 
 using WasmCodegen
 import NodeJS_24_jll
@@ -57,6 +61,40 @@ function bench_memory(reps::Int)
     return s
 end
 
+struct Vec2
+    x::Float32
+    y::Float32
+end
+function bench_vec2(n::Int)
+    s = 0.0f0
+    for i in 1:n
+        s += ccall((:ct_vec2_dot, libctest), Float32, (Vec2, Vec2), Vec2(i, 1), Vec2(0.5f0, s))
+    end
+    return s
+end
+
+@noinline sum_at(p::Ptr{Float64}, n::Int) = ccall((:ct_sum_f64, libctest), Float64, (Ptr{Float64}, Csize_t), p, n)
+function bench_cptr(n::Int)
+    p = Ptr{Float64}(Libc.malloc(32))
+    for i in 1:4
+        unsafe_store!(p, i * 0.5, i)
+    end
+    s = 0.0
+    for _ in 1:n
+        s += sum_at(p, 4)
+    end
+    Libc.free(p)
+    return s
+end
+
+function bench_string(n::Int)
+    s = UInt(0)
+    for _ in 1:n
+        s += ccall((:ct_count_char, libctest), Csize_t, (Cstring, Cchar), "hello, world", Cchar('o'))
+    end
+    return s
+end
+
 # the native time per call of `f(arg)` (the best of 5, after a warm-up)
 function native_time(f, arg)
     f(arg)
@@ -67,10 +105,12 @@ function main()
     dir = mktempdir()
     native, js = build(dir)
     global libctest = native
-    entries = [(bench_scalar, (Int,)), (bench_array, (Int,)), (bench_memory, (Int,))]
+    entries = [(bench_scalar, (Int,)), (bench_array, (Int,)), (bench_memory, (Int,)), (bench_vec2, (Int,)),
+               (bench_cptr, (Int,)), (bench_string, (Int,))]
     c = WasmCodegen.compile(entries; config=WasmCodegen.Config(c_linkage=CLinkage(libraries=[libctest])))
     write(joinpath(dir, "m.wasm"), c.bytes)
-    args = [("bench_scalar", 1_000_000), ("bench_array", 100), ("bench_memory", 100)]
+    args = [("bench_scalar", 1_000_000), ("bench_array", 100), ("bench_memory", 100), ("bench_vec2", 1_000_000),
+            ("bench_cptr", 1_000_000), ("bench_string", 1_000_000)]
     write(joinpath(dir, "run.mjs"), """
     import fs from 'node:fs';
     import create from $(repr(js));
@@ -103,7 +143,8 @@ function main()
         x = f(n)
         x == parse(typeof(x), r) || @warn "results differ" name native = x wasm = r
         what = name == "bench_scalar" ? "$n scalar calls" : name == "bench_array" ? "$n calls, $BENCH_N Float64 each" :
-               "$n x $BENCH_N stores + loads"
+               name == "bench_memory" ? "$n x $BENCH_N stores + loads" : name == "bench_vec2" ? "$n calls, 2 Vec2 by value" :
+               name == "bench_cptr" ? "$n calls, a C address (maybe owned)" : "$n calls, a 12-byte String"
         println(rpad(what, 34), rpad(string(round(t * 1e3; digits=3), " ms"), 14),
                 rpad(string(round(w * 1e3; digits=3), " ms"), 14), round(w / t; digits=1), "x")
     end

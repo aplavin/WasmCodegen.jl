@@ -770,31 +770,38 @@ C owns.
   to C at every call is better kept in C memory (`Libc.malloc`), where it is passed as its
   address, without a copy. C may not keep a pointer to a copy after the call (natively it may
   keep one into the object, while it lives).
-- **The space of a call** (copies, structs by value and results, the variadic buffer) is the C
-  stack's, allocated by the C module's exports (`CLinkage(stack_save, stack_alloc,
-  stack_restore)`, emscripten's `emscripten_stack_get_current`, `_emscripten_stack_alloc`,
-  `_emscripten_stack_restore`), up to `stack_limit` bytes per call (16 KiB of emscripten's
-  64 KiB), and the C heap's beyond (`malloc`, `free`), each piece aligned as its type is (any
-  power of two: the stack's allocations are aligned to 16, emscripten's `malloc` only to 8, so a
-  block for a 16-aligned `Int128` struct is taken larger and its address rounded up). It is
-  released when the call returns,
-  and when a Julia exception leaves it (a `try_table` catching every exception releases it and
-  throws the exception on): an error of a copy, or later of a C function's callback. A trap
-  (in a module where nothing catches, a Julia exception is one) unwinds to the host without
-  running any handler: the call's copies, its blocks of the C heap and its count of the stack's
-  bytes are left behind. No Julia code runs while a call into C is made, so the next call that
-  opens a frame finds them stale and discards them first (`Runtime.CLink.open_frame`): the
-  blocks are freed and no copy is reused or written back, so what a later call passes and gets
-  back is right. The C stack pointer is not restored: the module cannot know where the host's
-  own C frames end (it may call the module from a C function's import), so it stays where the
-  aborted call moved it, the space of that call lost (at most its arguments by value and
-  `stack_limit`), until the host restores it (reading it before calling the module, restoring it
-  after a trap). Copies already written back are not undone (none is: a trap after the call
-  returned, during the write-back, leaves the objects partly written back).
-- **Measured** (`test/clinkage/benchmark.jl`, Node.js 24, aarch64 macOS): a scalar C call in a
-  loop runs at about native speed (1.1×); a call passing a `Vector{Float64}` of 10^5 elements,
-  copied to C memory and back, about 2.7× native's; stores and loads through a pointer into C
-  memory about 1.5×.
+- **The space of a call.** What a call needs that is known when compiling (its result by
+  sret, its structs by value, its variadic buffer) is one block of the C stack, allocated by the
+  C module's exports (`CLinkage(stack_save, stack_alloc, stack_restore)`, emscripten's
+  `emscripten_stack_get_current`, `_emscripten_stack_alloc`, `_emscripten_stack_restore`) and
+  freed by restoring the stack pointer after the call. The copies of Julia objects belong to the
+  call's *frame* (`Runtime.CLink.open_frame`), opened by the first pointer into a Julia object
+  the call passes, at run time: a call that passes none (a pointer argument that turns out to be
+  a C address) opens none and costs a test of each such pointer's owner. The copies are on the C
+  stack up to `stack_limit` bytes per call (16 KiB of emscripten's 64 KiB) and on the C heap
+  beyond (`malloc`, `free`); a call whose known space alone exceeds `stack_limit` has it in its
+  frame too. Each piece is aligned as its type is (any power of two: the stack's allocations are
+  aligned to 16, emscripten's `malloc` only to 8, so a block for a 16-aligned `Int128` struct is
+  taken larger and its address rounded up). All is released when the call returns, and when a
+  Julia exception leaves it (a `try_table` catching every exception releases it and throws the
+  exception on): an error of a copy, or later of a C function's callback.
+- **After a trap** (in a module where nothing catches, a Julia exception is one; or any trap)
+  the module unwinds to the host without running any handler: the call's frame (its copies, its
+  blocks of the C heap, its count of the stack's bytes) is left behind. No Julia code runs while
+  a call into C is made, so the next call that opens a frame finds it stale and discards it
+  first: its blocks are freed and none of its copies is reused or written back, so what later
+  calls pass to C and get back is right. Objects a trapped call had already written back (a trap
+  during the write-back) stay partly written back. The C stack pointer is not restored: the
+  module cannot know where the host's own C frames end (it may have called the module from a C
+  function's import), so it stays where the aborted call moved it, the space of that call lost
+  (at most its known space and `stack_limit` bytes) until the host restores it (reading it,
+  `emscripten_stack_get_current`, before calling the module and restoring it after a trap).
+- **Measured** (`test/clinkage/benchmark.jl`, Node.js 24, aarch64 macOS; wasm time / native
+  time): a scalar C call in a loop 1.1-1.3×; a call passing two small structs by value (ImVec2)
+  2.1×; a call whose pointer argument may point into a Julia object but is a C address at run
+  time 0.8×; a call passing a 12-byte `String` (copied) 8×; a call passing a `Vector{Float64}`
+  of 10^5 elements, copied to C memory and back, 2.9×; stores and loads through a pointer into
+  C memory 1.8×.
 - **Not yet.** C calling back into Julia: a `@cfunction` pointer passed to C would have to be an
   index of the C module's indirect function table (`__indirect_function_table`, which emscripten
   grows only with `-sALLOW_TABLE_GROWTH`), where the module would put its `cfunction`s (WasmGC

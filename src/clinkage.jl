@@ -187,9 +187,51 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
     # arguments, and the pointers in structs by value)
     owned = [k for k in eachindex(ATs) if aabis[k].kind === :pointer && !ownerless(vals[k])]
     copies = !isempty(owned) || any(k -> aabis[k].kind !== :pointer && maybe_owned(vals[k], ATs[k]), fixed)
-    space = rabi.kind === :indirect || variadic || copies || any(a -> a.kind === :indirect, aabis)
-    guarded = space && cgm.exceptions !== :none
-    frame = space ? materialize!(fc, call_runtime!(fc, Runtime.CLink.open_frame, CGVal[])) : nothing
+    # the space the call needs, known here: the result's (sret), the structs by value and the
+    # variadic buffer, (offset, bytes, alignment) in one block
+    pieces = Dict{Any,Tuple{Int,Int,Int}}()
+    size, align = 0, 1
+    for (key, n, al) in Any[(rabi.kind === :indirect ? [(:sret, sizeof(RT), Base.datatype_alignment(RT))] : [])...,
+                            [(k, sizeof(ATs[k]), Base.datatype_alignment(ATs[k])) for k in fixed if aabis[k].kind === :indirect]...,
+                            (variadic ? [(:varargs, c_varargs_layout(ATs, aabis, nreq)[2], 16)] : [])...]
+        size = cld(size, al) * al
+        pieces[key] = (size, n, al)
+        size += n
+        align = max(align, al)
+    end
+    # on the C stack, from its pointer (restored after the call) when it fits the stack's share,
+    # else in the call's frame (`Runtime.CLink.scratch`: on the C heap); the frame, which the
+    # copies need, opened by the first pointer into a Julia object the call passes (`fr`: 0
+    # until then), so that a call passing none costs nothing more
+    onstack = size > 0 && size + max(align - 16, 0) + 16 <= cl.stack_limit
+    fr = copies || (size > 0 && !onstack) ? new_local!(fc, I64) : nothing
+    frame = CallFrame(fr)
+    if fr !== nothing
+        if size > 0 && !onstack
+            push_val!(fc, call_runtime!(fc, Runtime.CLink.open_frame, CGVal[]))
+        else
+            emit!(fc.b, :i64_const, 0)
+        end
+        emit!(fc.b, :local_set, fr)
+    end
+    if onstack
+        sp, base = new_local!(fc, I64), new_local!(fc, I64)
+        call!(fc.b, c_stack_import!(cgm, :save)); emit!(fc.b, :local_set, sp)
+        emit!(fc.b, :i64_const, size + max(align - 16, 0))
+        call!(fc.b, c_stack_import!(cgm, :alloc))
+        if align > 16
+            emit!(fc.b, :i64_const, align - 1); emit!(fc.b, :i64_add); emit!(fc.b, :i64_const, -align); emit!(fc.b, :i64_and)
+        end
+        emit!(fc.b, :local_set, base)
+    end
+    function piece!(key)
+        off, n, al = pieces[key]
+        onstack || return c_scratch!(fc, n, al)
+        l = new_local!(fc, I64)
+        emit!(fc.b, :local_get, base); emit!(fc.b, :i64_const, off); emit!(fc.b, :i64_add); emit!(fc.b, :local_set, l)
+        return l
+    end
+    guarded = (onstack || fr !== nothing) && cgm.exceptions !== :none
     if guarded
         # (the space is released when the call throws too: the exception thrown on after)
         block!(fc.b); open_label!(fc)
@@ -198,56 +240,50 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
     end
     params, pushes = ValType[], LeafVal[]
     if rabi.kind === :indirect
-        sret = c_scratch!(fc, sizeof(RT), Base.datatype_alignment(RT))
-        push!(params, I64); push!(pushes, sret)
+        push!(params, I64); push!(pushes, piece!(:sret))
     end
-    addrs = Dict{Int,Int}()
+    addrs = Dict{Int,LeafVal}()
     for k in owned
-        addrs[k] = c_pointer_address!(fc, vals[k])
+        addrs[k] = c_pointer_address!(fc, vals[k], frame)
     end
     for k in fixed
         a, v, T = aabis[k], vals[k], ATs[k]
         if a.kind === :scalar
             t = c_scalar_wtype(a.type)
-            push_c_scalar!(fc, v, T, a.type, CallFrame(nothing))
+            push_c_scalar!(fc, v, T, a.type, frame)
             l = new_local!(fc, t); emit!(fc.b, :local_set, l)
             push!(params, t); push!(pushes, l)
         elseif a.kind === :pointer
             push!(params, I64); push!(pushes, get(addrs, k, v.leaves[1]))
         elseif a.kind === :indirect
-            c = c_scratch!(fc, sizeof(T), Base.datatype_alignment(T))
-            c_store!(fc, c_pointer(fc, c, T), convert_repr(fc, v, T), const_value(fc, 1); owned=CallFrame(nothing))
+            c = piece!(k)
+            c_store!(fc, c_pointer(fc, c, T), convert_repr(fc, v, T), const_value(fc, 1); owned=frame)
             push!(params, I64); push!(pushes, c)
         end
     end
     if variadic
-        push!(params, I64); push!(pushes, c_varargs!(fc, vals, ATs, aabis, nreq, addrs))
+        push!(params, I64); push!(pushes, c_varargs!(fc, piece!(:varargs), vals, ATs, aabis, nreq, addrs))
     end
     results = rabi.kind === :scalar ? ValType[c_scalar_wtype(rabi.type)] :
               rabi.kind === :pointer ? ValType[I64] : ValType[]
     foreach(l -> push_leaf!(fc, l), pushes)
     call!(fc.b, c_import!(cgm, name, params, results))
+    # (a pointer C returns into a copy is into its object: mapped while the copies are alive,
+    # until `close_frame` writes them back and drops them)
     res = if rabi.kind === :scalar
         pop_c_scalar!(fc, RT, rabi.type)
     elseif rabi.kind === :pointer
         a = new_local!(fc, I64); emit!(fc.b, :local_set, a)
         CGVal(RT, Inline, LeafVal[a, Inst(:ref_null, cgm.types.jlvalue)])
     elseif rabi.kind === :indirect
-        # (a pointer C returns into a copy is into its object, as below)
-        c_load!(fc, c_pointer(fc, pushes[1]::Int, RT), const_value(fc, 1), RT; frame=copies ? CallFrame(nothing) : nothing)
+        c_load!(fc, c_pointer(fc, pushes[1]::Int, RT), const_value(fc, 1), RT; frame=copies ? frame : nothing)
     else
         RT === Cvoid || RT === Nothing ? ghost(Nothing, nothing) : ghost(RT, something(ghost_value(RT)))
     end
-    if copies
-        # (a pointer C returns into a copy is into its object: mapped while the copies are
-        # alive, until `close_frame` writes them back and drops them)
-        if rabi.kind === :pointer || (rabi.kind === :scalar && is_ptr_type(rabi.type))
-            res = CGVal(RT, Inline, c_back_pointer!(fc, res.leaves[1], CallFrame(nothing), nothing).leaves)
-        end
+    if copies && (rabi.kind === :pointer || (rabi.kind === :scalar && is_ptr_type(rabi.type)))
+        res = CGVal(RT, Inline, c_back_pointer!(fc, res.leaves[1], frame, nothing).leaves)
     end
-    if space
-        call_runtime!(fc, Runtime.CLink.close_frame, CGVal[CGVal(Int, Inline, LeafVal[frame])])
-    end
+    c_end_call!(fc, fr, onstack ? sp : nothing, Runtime.CLink.close_frame)
     if guarded
         br!(fc.b, 2)
         end!(fc.b); close_label!(fc)
@@ -255,12 +291,36 @@ function emit_c_call!(fc::FnCtx, name::Symbol, ex::Expr, args::Vector{Any}, @nos
         end!(fc.b); close_label!(fc)
         exn = new_local!(fc, RefType(:exn, false))
         emit!(fc.b, :local_set, exn)
-        call_runtime!(fc, Runtime.CLink.release_frame, CGVal[CGVal(Int, Inline, LeafVal[frame])])
+        c_end_call!(fc, fr, onstack ? sp : nothing, Runtime.CLink.release_frame)
         emit!(fc.b, :local_get, exn)
         throw_ref!(fc.b)
         end!(fc.b); close_label!(fc)
     end
     return convert_repr(fc, res, typ)
+end
+
+# the end of a call: its frame, if it was opened (the local `fr`), ended by `close` (the call
+# returned: `Runtime.CLink.close_frame`) or released (it threw), and the C stack pointer
+# restored to the local `sp` (of a call whose space is on the stack)
+function c_end_call!(fc::FnCtx, fr::Union{Nothing,Int}, sp::Union{Nothing,Int}, @nospecialize(close))
+    if fr !== nothing
+        emit!(fc.b, :local_get, fr); emit!(fc.b, :i64_eqz); emit!(fc.b, :i32_eqz)
+        if!(fc.b)
+        call_runtime!(fc, close, CGVal[CGVal(Int, Inline, LeafVal[fr])])
+        end!(fc.b)
+    end
+    if sp !== nothing
+        emit!(fc.b, :local_get, sp)
+        call!(fc.b, c_stack_import!(fc.cgm, :restore))
+    end
+end
+
+"The import of the C module's stack pointer's `:save`, `:alloc` or `:restore` (`CLinkage(stack_save, ...)`)."
+function c_stack_import!(cgm::CGModule, which::Symbol)
+    cl = cgm.config.c_linkage::CLinkage
+    which === :save && return c_import!(cgm, Symbol(cl.stack_save), ValType[], ValType[I64])
+    which === :alloc && return c_import!(cgm, Symbol(cl.stack_alloc), ValType[I64], ValType[I64])
+    return c_import!(cgm, Symbol(cl.stack_restore), ValType[I64], ValType[])
 end
 
 # the pointer `p` as a `Ptr{Cvoid}` (its leaves)
@@ -280,7 +340,9 @@ end
     CallFrame(loc)
 
 Where the copies a call into the C module makes of the objects its pointers point into belong:
-the call's frame, open (`loc === nothing`: in `Runtime.CLink`'s code, which a call's frame runs).
+the call's frame, in the local `loc` (0 until the call's first pointer into a Julia object opens
+it, `Runtime.CLink.open_frame`), or open (`loc === nothing`: in `Runtime.CLink`'s code, which a
+call's frame runs).
 """
 struct CallFrame
     loc::Union{Nothing,Int}
@@ -298,6 +360,13 @@ function c_pointer_address!(fc::FnCtx, p::CGVal, frame::CallFrame=CallFrame(noth
     if!(fc.b, I64)
     push_leaf!(fc, p.leaves[1])
     else!(fc.b)
+    if frame.loc !== nothing
+        # (the call's first pointer into a Julia object opens its frame)
+        emit!(fc.b, :local_get, frame.loc); emit!(fc.b, :i64_eqz)
+        if!(fc.b)
+        push_val!(fc, call_runtime!(fc, Runtime.CLink.open_frame, CGVal[])); emit!(fc.b, :local_set, frame.loc)
+        end!(fc.b)
+    end
     push_val!(fc, call_runtime!(fc, Runtime.CLink.to_c, CGVal[void_ptr(p)]))
     end!(fc.b)
     emit!(fc.b, :local_set, a)
@@ -311,12 +380,18 @@ leaves) passed there before the call, or `Runtime.CLink.from_c`.
 """
 function c_back_pointer!(fc::FnCtx, a::LeafVal, frame::CallFrame, old)
     av = CGVal(UInt64, Inline, LeafVal[a])
-    r = if old !== nothing
-        call_runtime!(fc, Runtime.CLink.back_pointer, CGVal[av, CGVal(Ptr{Cvoid}, Inline, LeafVal[old...])])
-    else
-        call_runtime!(fc, Runtime.CLink.from_c, CGVal[av])
-    end
-    return convert_repr(fc, r, Ptr{Cvoid})
+    old === nothing || return convert_repr(fc, call_runtime!(fc, Runtime.CLink.back_pointer,
+                                                             CGVal[av, CGVal(Ptr{Cvoid}, Inline, LeafVal[old...])]), Ptr{Cvoid})
+    frame.loc === nothing && return convert_repr(fc, call_runtime!(fc, Runtime.CLink.from_c, CGVal[av]), Ptr{Cvoid})
+    # (a call whose frame was not opened made no copies: a C address)
+    r = new_val!(fc, Ptr{Cvoid})
+    emit!(fc.b, :local_get, frame.loc); emit!(fc.b, :i64_eqz)
+    if!(fc.b)
+    assign!(fc, r, CGVal(Ptr{Cvoid}, Inline, LeafVal[a, Inst(:ref_null, fc.cgm.types.jlvalue)]))
+    else!(fc.b)
+    assign!(fc, r, call_runtime!(fc, Runtime.CLink.from_c, CGVal[av]))
+    end!(fc.b)
+    return r
 end
 
 """
@@ -396,11 +471,12 @@ function check_ownerless!(fc::FnCtx, owner::LeafVal, @nospecialize(err))
 end
 
 """
-The buffer of the variadic arguments (from `nreq + 1`) of a call: each at its alignment, as
-its declared type says (a pointer as its address: `addrs`, else its own). A local.
+    c_varargs_layout(ATs, abis, nreq) -> (offsets, bytes)
+
+The layout of the buffer of the variadic arguments (from `nreq + 1`) of a call: each at its
+alignment, as its declared type says.
 """
-function c_varargs!(fc::FnCtx, vals::Vector{CGVal}, ATs::Vector{Any}, abis::Vector{CAbi}, nreq::Int,
-                    addrs::Dict{Int,Int})
+function c_varargs_layout(ATs::Vector{Any}, abis::Vector{CAbi}, nreq::Int)
     offs = Int[]
     off = 0
     for k in nreq+1:length(ATs)
@@ -409,8 +485,17 @@ function c_varargs!(fc::FnCtx, vals::Vector{CGVal}, ATs::Vector{Any}, abis::Vect
         push!(offs, off)
         off += s
     end
+    return offs, off
+end
+
+"""
+The variadic arguments (from `nreq + 1`) of a call stored in their buffer, at the address in the
+local `buf` (`c_varargs_layout`): a pointer as its address (`addrs`), else its own. `buf`.
+"""
+function c_varargs!(fc::FnCtx, buf::Int, vals::Vector{CGVal}, ATs::Vector{Any}, abis::Vector{CAbi}, nreq::Int,
+                    addrs::Dict{Int,LeafVal})
+    offs, _ = c_varargs_layout(ATs, abis, nreq)
     c_memory!(fc.cgm)
-    buf = c_scratch!(fc, off, 16)
     for (j, k) in enumerate(nreq+1:length(ATs))
         a = abis[k]
         emit!(fc.b, :local_get, buf)

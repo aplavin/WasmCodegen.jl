@@ -782,6 +782,23 @@ function ct_io_struct()
     return (m, ct_io_digest())
 end
 
+# a Julia exception between the copies and the call, of a call whose structs by value are on
+# the C stack and whose frame its pointer into a Julia object opened: both released
+function ct_stack_after_error2(n::Int)
+    sp = ccall((:emscripten_stack_get_current, libctest), UInt64, ())
+    v = Any[1.0]
+    ok = try
+        GC.@preserve v ccall((:ct_spec_sum, libctest), Float64, (CtSpec,), CtSpec(1, 0, Ptr{Float32}(pointer(v)), 0, C_NULL))
+        false
+    catch e
+        e isa ArgumentError
+    end
+    return (ok, ccall((:emscripten_stack_get_current, libctest), UInt64, ()) == sp)
+end
+# a call passing structs by value and no pointer into a Julia object: its space on the C stack,
+# no frame
+ct_dot_only(x::Float32) = ccall((:ct_vec2_dot, libctest), Float32, (CtVec2, CtVec2), CtVec2(x, 1), CtVec2(2, x))
+
 @testset "C linkage: structs by value" begin
     if HAS_C_TOOLCHAIN
         @ctest ct_structs(1.5f0, -2.25)
@@ -795,6 +812,14 @@ end
         @ctest ct_aligned(3, 32)
         @ctest ct_aligned(600, 32)
         @ctest ct_aligned(600, 40)
+        @test crun(ct_stack_after_error2, 1) == (true, true)
+        @ctest ct_dot_only(1.5f0)
+        # (the space of the calls beyond the stack's share: in a frame, on the C heap)
+        for (f, args) in ((ct_structs, (1.5f0, -2.25)), (ct_specs, (6,)))
+            c = WasmCodegen.compile(f, map(typeof, args); config=ctest_config(stack_limit=48))
+            @test wasm_run(c, string(nameof(f)), args...; rettype=Base.return_types(f, map(typeof, args))[1],
+                           cmodule=CTEST_JS[]) == f(args...)
+        end
         # (the Wasm types the C ABI gives: ImVec2 by the address of a copy, a result by sret, a
         # struct of one float as a float, an empty struct dropped)
         c = ccompile(ct_structs, (Float32, Float64))
@@ -804,6 +829,8 @@ end
         @test (imp("ct_one_twice").params, imp("ct_one_twice").results) == (ValType[F32], ValType[F32])
         @test (imp("ct_handle_next").params, imp("ct_handle_next").results) == (ValType[I64], ValType[I64])
         @test isempty(imp("ct_empty_ret").results)
+        c = ccompile(ct_dot_only, (Float32,))
+        @test !any(f -> occursin("open_frame", f.name), c.cgm.mod.funcs)
         c = ccompile(ct_empty_arg, (Cint,))
         @test only(f for f in c.cgm.mod.funcs if f.imported == ("c", "ct_empty_arg")).params == ValType[I32, I32]
     end
@@ -830,6 +857,9 @@ end
         c = ccompile(ct_varargs, (Cint, Float64))
         imp(name) = only(f for f in c.cgm.mod.funcs if f.imported == ("c", name))
         @test imp("ct_vsum").params == ValType[I32, I64] && imp("ct_vmix").params == ValType[I64, I64]
+        c = WasmCodegen.compile(ct_varargs, (Cint, Float64); config=ctest_config(stack_limit=48))
+        @test wasm_run(c, "ct_varargs", Cint(3), 0.5; rettype=typeof(ct_varargs(Cint(3), 0.5)),
+                       cmodule=CTEST_JS[]) == ct_varargs(Cint(3), 0.5)
     end
     # a struct by value as a variadic argument
     f(v::CtVec2) = @ccall libctest.ct_vsum(1::Cint; v::CtVec2)::Cint
