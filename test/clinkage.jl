@@ -795,6 +795,45 @@ function ct_stack_after_error2(n::Int)
     end
     return (ok, ccall((:emscripten_stack_get_current, libctest), UInt64, ()) == sp)
 end
+# structs of one scalar, fields of no size aside (passed and returned as the scalar), of none
+struct CtS8
+    v::Int8
+end
+struct CtU16s
+    v::UInt16
+end
+struct CtSBool
+    v::Bool
+end
+struct CtPaddedOne
+    e::CtEmpty
+    d::Float64
+    f::CtEmpty
+end
+struct CtOnlyEmpty
+    e::CtEmpty
+end
+function ct_single(x::Int8, y::UInt16, b::Bool, f::Float32, d::Float64)
+    s8 = ccall((:ct_s8_neg, libctest), CtS8, (CtS8,), CtS8(x))
+    i8 = ccall((:ct_s8_int, libctest), Cint, (CtS8,), CtS8(x))
+    u = ccall((:ct_u16s_inc, libctest), CtU16s, (CtU16s,), CtU16s(y))
+    iu = ccall((:ct_u16s_int, libctest), Cuint, (CtU16s,), CtU16s(y))
+    nb = ccall((:ct_sbool_not, libctest), CtSBool, (CtSBool,), CtSBool(b))
+    ib = ccall((:ct_sbool_int, libctest), Cint, (CtSBool,), CtSBool(b))
+    a1 = ccall((:ct_arr1_twice, libctest), NTuple{1,Float32}, (NTuple{1,Float32},), (f,))
+    pg = ccall((:ct_padded_one_get, libctest), Float64, (CtPaddedOne,), CtPaddedOne(CtEmpty(), d, CtEmpty()))
+    pm = ccall((:ct_padded_one_make, libctest), CtPaddedOne, (Float64,), d)
+    oer = ccall((:ct_only_empty_ret, libctest), CtOnlyEmpty, ())
+    return (s8, i8, u, iu, nb, ib, a1, pg, pm.d, oer)
+end
+# (natively Julia refuses an argument of no size, `ct_empty_arg`)
+ct_only_empty(a::Cint) = ccall((:ct_only_empty_arg, libctest), Cint, (Cint, CtOnlyEmpty, Cint), a, CtOnlyEmpty(CtEmpty()), Cint(2))
+# a C int declared `Bool`: its low bit, as natively (where the low byte is kept, and branches,
+# `Int` and `!` read its low bit)
+ct_bool_results() = map((0, 1, 2, 3, 255, 256, 257, -1)) do x
+    b = ccall((:ct_int_id, libctest), Bool, (Cint,), Cint(x))
+    (b ? 1 : 0, Int(b), !b)
+end
 # a call passing structs by value and no pointer into a Julia object: its space on the C stack,
 # no frame
 ct_dot_only(x::Float32) = ccall((:ct_vec2_dot, libctest), Float32, (CtVec2, CtVec2), CtVec2(x, 1), CtVec2(2, x))
@@ -814,6 +853,18 @@ ct_dot_only(x::Float32) = ccall((:ct_vec2_dot, libctest), Float32, (CtVec2, CtVe
         @ctest ct_aligned(600, 40)
         @test crun(ct_stack_after_error2, 1) == (true, true)
         @ctest ct_dot_only(1.5f0)
+        @ctest ct_single(Int8(-7), 0xfffe, true, 1.25f0, -3.5)
+        @ctest ct_single(Int8(-128), 0x0007, false, -0.0f0, 1e300)
+        @ctest ct_bool_results()
+        @test crun(ct_only_empty, Cint(4)) === Cint(42)
+        c = ccompile(ct_single, (Int8, UInt16, Bool, Float32, Float64))
+        imp(name) = only(f for f in c.cgm.mod.funcs if f.imported == ("c", name))
+        @test (imp("ct_s8_neg").params, imp("ct_s8_neg").results) == (ValType[I32], ValType[I32])
+        @test (imp("ct_arr1_twice").params, imp("ct_arr1_twice").results) == (ValType[F32], ValType[F32])
+        @test (imp("ct_padded_one_make").params, imp("ct_padded_one_make").results) == (ValType[F64], ValType[F64])
+        @test isempty(imp("ct_only_empty_ret").results)
+        c = ccompile(ct_only_empty, (Cint,))
+        @test only(f for f in c.cgm.mod.funcs if f.imported == ("c", "ct_only_empty_arg")).params == ValType[I32, I32]
         # (the space of the calls beyond the stack's share: in a frame, on the C heap)
         for (f, args) in ((ct_structs, (1.5f0, -2.25)), (ct_specs, (6,)))
             c = WasmCodegen.compile(f, map(typeof, args); config=ctest_config(stack_limit=48))
@@ -850,10 +901,37 @@ function ct_varargs(a::Cint, b::Float64)
     return (s0, s3, m, x[], sdigest(String(buf[1:n])))
 end
 
+# small integers as variadic arguments, declared as they are (no promotion: each is an i32 of
+# the buffer, extended by its signedness, which C reads as the int it promotes them to); an i32
+# followed by a pointer; a result by sret of a variadic function
+function ct_varargs_small(a::Int8, b::Int16, c::Bool, d::UInt8, e::UInt16)
+    s = @ccall libctest.ct_vints(5::Cint; a::Int8, b::Int16, c::Bool, d::UInt8, e::UInt16)::Cint
+    x = Ref{Cint}(3)
+    m = @ccall libctest.ct_vmix("ip"::Cstring; Cint(a)::Cint, x::Ptr{Cint})::Float64
+    return (s, m, x[])
+end
+# (natively Julia 1.13 on aarch64 macOS passes the variadic arguments of a call with a result by
+# sret wrongly: C reads garbage, so this is compared with what C computes)
+ct_varargs_sret(b::Float64) = @ccall libctest.ct_vbig(3::Cint; 1.5::Float64, -2.0::Float64, b::Float64)::CtBig
+# the bytes of the buffer (wasm only): an i32 slot each for Int8, Int16, Bool (extended), an f32
+# for a Float32 (not promoted), an i32, a pointer at 8 bytes
+function ct_varargs_raw(a::Int8, b::Int16, f::Float32, pa::UInt)
+    buf = zeros(UInt8, 32)
+    p = Ptr{Cvoid}(pa)
+    @ccall libctest.ct_vraw(buf::Ptr{UInt8}, 32::Cint; a::Int8, b::Int16, true::Bool, f::Float32, Int32(-2)::Int32,
+                            p::Ptr{Cvoid})::Cvoid
+    return (reinterpret(Int32, buf[1:4])[1], reinterpret(Int32, buf[5:8])[1], reinterpret(Int32, buf[9:12])[1],
+            reinterpret(Float32, buf[13:16])[1], reinterpret(Int32, buf[17:20])[1], reinterpret(UInt64, buf[25:32])[1])
+end
+
 @testset "C linkage: varargs" begin
     if HAS_C_TOOLCHAIN
         @ctest ct_varargs(Cint(12), 2.5)
         @ctest ct_varargs(Cint(-1), -1e10)
+        @ctest ct_varargs_small(Int8(-5), Int16(-300), true, 0xc8, 0xea60)
+        @ctest ct_varargs_small(Int8(127), Int16(32767), false, 0x00, 0xffff)
+        @test crun(ct_varargs_sret, -0.75) === CtBig((1.5, -2.0, -0.75, -1.0, -1.0, -1.0), Int32(3))
+        @test crun(ct_varargs_raw, Int8(-5), Int16(-300), 1.5f0, UInt(0x1234_5678_9abc)) == (Int32(-5), Int32(-300), Int32(1), 1.5f0, Int32(-2), 0x0000_1234_5678_9abc)
         c = ccompile(ct_varargs, (Cint, Float64))
         imp(name) = only(f for f in c.cgm.mod.funcs if f.imported == ("c", name))
         @test imp("ct_vsum").params == ValType[I32, I64] && imp("ct_vmix").params == ValType[I64, I64]

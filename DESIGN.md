@@ -737,10 +737,16 @@ C owns.
   to 32 bits and `Bool` are `i32`s, extended by their signedness (an enum's integer's), 64-bit
   ones `i64`s, floats `f32` and `f64`, pointers (`Ptr`, `Ref`, `Cstring`, `Cwstring`) `i64`
   addresses; an isbits struct or tuple by value is nothing when empty, its scalar when it holds
-  one (through structs of one field), else the address of a copy the caller makes; such a result
-  is written by the callee at an address the caller passes first (sret); a variadic call passes
-  its variadic arguments in a buffer, each at its alignment as its declared type says (no
-  default promotion: as Julia's `ccall`, that is the caller's), as one more parameter. Types
+  one (through structs and tuples of one field, fields of no size aside: clang's
+  `isSingleElementStruct`), else the address of a copy the caller makes; such a result is
+  written by the callee at an address the caller passes first (sret). A `Bool` result is the
+  low bit of what C returns (natively the low byte is kept, and branches, `Int` and `!` read its
+  low bit: a C `int` other than 0 or 1 declared `Bool` reads so here too). A variadic call passes
+  its variadic arguments in a buffer, as one more parameter, each in a slot of its Wasm type at
+  that type's alignment, as LLVM lowers a variadic call of wasm64 with the declared types: an
+  integer of less than 32 bits or a `Bool` is an `i32` extended by its signedness (which C reads
+  as the `int` it promotes it to), a `Float32` an `f32` (no default promotion: as Julia's
+  `ccall`, that is the caller's; C's `va_arg(ap, double)` cannot read it). Types
   that are none of these (not isbits, `Any`, `Float16`, 128-bit integers, a struct by value as
   a variadic argument) are unsupported constructs naming the call.
 - **Pointers into Julia objects passed to C** (`runtime/clink.jl`). A pointer into a Julia

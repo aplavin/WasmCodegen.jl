@@ -209,6 +209,27 @@ EXPORT double ct_big_sum(ct_big b) {
     for (int i = 0; i < 6; i++) s += b.m[i];
     return s;
 }
+/* structs of one scalar (clang's single-element structs: passed as the scalar), fields of no
+ * size aside; a struct of only an empty struct (none) */
+typedef struct { int8_t v; } ct_s8;
+typedef struct { uint16_t v; } ct_u16s;
+typedef struct { bool v; } ct_sbool;
+typedef struct { float v[1]; } ct_arr1;
+typedef struct { ct_empty e; double d; ct_empty f; } ct_padded_one;
+typedef struct { ct_empty e; } ct_only_empty;
+EXPORT ct_s8 ct_s8_neg(ct_s8 x) { x.v = (int8_t)-x.v; return x; }
+EXPORT int ct_s8_int(ct_s8 x) { return x.v; }
+EXPORT ct_u16s ct_u16s_inc(ct_u16s x) { x.v++; return x; }
+EXPORT unsigned ct_u16s_int(ct_u16s x) { return x.v; }
+EXPORT ct_sbool ct_sbool_not(ct_sbool x) { x.v = !x.v; return x; }
+EXPORT int ct_sbool_int(ct_sbool x) { return x.v ? 3 : -3; }
+EXPORT ct_arr1 ct_arr1_twice(ct_arr1 a) { a.v[0] *= 2; return a; }
+EXPORT double ct_padded_one_get(ct_padded_one p) { return p.d; }
+EXPORT ct_padded_one ct_padded_one_make(double d) { ct_padded_one p; p.d = d * 3; return p; }
+EXPORT int ct_only_empty_arg(int a, ct_only_empty e, int b) { (void)e; return a * 10 + b; }
+EXPORT ct_only_empty ct_only_empty_ret(void) { ct_only_empty e; return e; }
+/* an int declared Bool by the caller */
+EXPORT int ct_int_id(int x) { return x; }
 /* a struct by value and a pointer to one, written */
 EXPORT void ct_vec2_store(ct_vec2 v, ct_vec2 *out) { out->x = v.y; out->y = v.x; }
 
@@ -312,6 +333,35 @@ EXPORT int ct_sprintf(char *buf, size_t n, const char *fmt, ...) {
     va_end(ap);
     return r;
 }
+
+/* small integers passed as variadic arguments (no promotion by the caller): read as ints */
+EXPORT int ct_vints(int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    int s = 0;
+    for (int i = 0; i < n; i++) s = s * 7 + va_arg(ap, int);
+    va_end(ap);
+    return s;
+}
+/* a result by sret of a variadic function */
+EXPORT ct_big ct_vbig(int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    ct_big b;
+    for (int i = 0; i < 6; i++) b.m[i] = i < n ? va_arg(ap, double) : -1;
+    b.k = n;
+    va_end(ap);
+    return b;
+}
+#ifdef __EMSCRIPTEN__
+/* the bytes of the variadic buffer (wasm's va_list is a pointer into it) */
+EXPORT void ct_vraw(unsigned char *dst, int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    memcpy(dst, (const void *)ap, (size_t)n);
+    va_end(ap);
+}
+#endif
 
 /* the heap: blocks Julia allocates (Libc.malloc), read and written here */
 EXPORT int64_t ct_heap_sum(const int64_t *p, size_t n) {

@@ -87,12 +87,15 @@ end
 c_pointee(@nospecialize(T)) = is_ref_type(T) ? T.parameters[1] : T === Cstring ? UInt8 :
                               T === Cwstring ? Cwchar_t : eltype(T)
 
-# the primitive or pointer type of the one scalar an isbits struct holds (through structs
-# and tuples of one field), or nothing
+# the primitive or pointer type of the one scalar an isbits struct holds (through structs and
+# tuples of one field besides fields of no size, of its size: clang's `isSingleElementStruct`),
+# or nothing
 function single_scalar(@nospecialize(T))
     while !(isprimitivetype(T) || is_ptr_type(T))
-        (isstructtype(T) && fieldcount(T) == 1 && sizeof(fieldtype(T, 1)) == sizeof(T)) || return nothing
-        T = fieldtype(T, 1)
+        isstructtype(T) || return nothing
+        fs = Any[fieldtype(T, i) for i in 1:fieldcount(T) if sizeof(fieldtype(T, i)) > 0]
+        (length(fs) == 1 && sizeof(fs[1]) == sizeof(T)) || return nothing
+        T = fs[1]
     end
     return T
 end
@@ -441,14 +444,17 @@ function push_c_scalar!(fc::FnCtx, v::CGVal, @nospecialize(T), @nospecialize(P),
 end
 
 # the result of type `RT`, the scalar `P` on the stack: a small integer as Julia keeps it
-# (zero-extended), a pointer without owner
+# (zero-extended), a `Bool` its low bit, a pointer without owner. (Natively a `Bool` result is
+# the low byte of what C returns, of which branches, `Int` and `!` read the low bit: so for a C
+# `int` other than 0 or 1 declared `Bool`; here the value is that bit.)
 function pop_c_scalar!(fc::FnCtx, @nospecialize(RT), @nospecialize(P))
     t = c_scalar_wtype(P)
     if is_ptr_type(P)
         a = new_local!(fc, I64); emit!(fc.b, :local_set, a)
         leaves = LeafVal[a, Inst(:ref_null, fc.cgm.types.jlvalue)]
     else
-        sizeof(P) < 4 && (emit!(fc.b, :i32_const, (1 << 8sizeof(P)) - 1); emit!(fc.b, :i32_and))
+        P === Bool && (emit!(fc.b, :i32_const, 1); emit!(fc.b, :i32_and))
+        P !== Bool && sizeof(P) < 4 && (emit!(fc.b, :i32_const, (1 << 8sizeof(P)) - 1); emit!(fc.b, :i32_and))
         r = new_local!(fc, t); emit!(fc.b, :local_set, r)
         leaves = LeafVal[r]
     end
@@ -473,14 +479,17 @@ end
 """
     c_varargs_layout(ATs, abis, nreq) -> (offsets, bytes)
 
-The layout of the buffer of the variadic arguments (from `nreq + 1`) of a call: each at its
-alignment, as its declared type says.
+The layout of the buffer of the variadic arguments (from `nreq + 1`) of a call: each in a slot of
+its Wasm type (`c_scalar_wtype`: an integer of less than 32 bits, a `Bool`, in an `i32`, extended
+by its signedness), at the slot's alignment, as LLVM lowers a variadic call of wasm64 whose
+arguments have the declared types (no default promotion, as Julia's `ccall`: a `Float32` is an
+`f32`, which C cannot read as the `double` its `va_arg` would promote it to).
 """
 function c_varargs_layout(ATs::Vector{Any}, abis::Vector{CAbi}, nreq::Int)
     offs = Int[]
     off = 0
     for k in nreq+1:length(ATs)
-        s = abis[k].kind === :pointer ? 8 : sizeof(abis[k].type)
+        s = abis[k].kind === :pointer ? 8 : max(sizeof(abis[k].type), 4)
         off = cld(off, s) * s
         push!(offs, off)
         off += s
@@ -505,7 +514,7 @@ function c_varargs!(fc::FnCtx, buf::Int, vals::Vector{CGVal}, ATs::Vector{Any}, 
         else
             P = a.type
             push_c_scalar!(fc, vals[k], ATs[k], P, CallFrame(nothing))
-            n = is_ptr_type(P) ? 8 : sizeof(P)
+            n = is_ptr_type(P) ? 8 : max(sizeof(P), 4)
             emit!(fc.b, c_access_op(c_scalar_wtype(P), n, true), trailing_zeros(n), offs[j])
         end
     end
