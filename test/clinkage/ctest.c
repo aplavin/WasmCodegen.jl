@@ -163,6 +163,13 @@ EXPORT double ct_holder_sum(ct_holder *h) {
 }
 EXPORT void ct_holder_advance(ct_holder *h) { h->data += 1; h->n -= 1; }
 EXPORT void ct_holder_rename(ct_holder *h) { h->name = ct_name(1); }
+/* one object passed directly and through an array of pointers: one copy (a == pp[0]) */
+EXPORT void ct_write_both(unsigned char *a, unsigned char **pp) {
+    a[0] = 'X';
+    pp[0][1] = 'Y';
+    pp[1][2] = 'Z';
+    a[3] = pp[0] == a ? '=' : '!';
+}
 /* write into a buffer */
 EXPORT int ct_format(char *buf, size_t n, int x, double y) { return snprintf(buf, n, "x=%d y=%.3f", x, y); }
 

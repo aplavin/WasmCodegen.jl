@@ -4,15 +4,22 @@
 # test/clinkage/ctest.c natively (a shared library, clang) and compiled to Wasm (the library
 # built by emscripten with -m64, the module linked with it in Node.js), and their results must
 # be equal. The toolchains are those of test/clinkage/shell.nix; without `emcc` and `clang` on
-# the PATH these tests are skipped.
+# the PATH these tests are skipped, but those that only compile.
+#
+# The differential results cannot see that a pointer into a Julia object reaches C as a copy:
+# what C reads and writes through it is the same as natively. The copies show only where C
+# returns, keeps or compares pointers, or writes pointers into what it is given; the tests of
+# those (`ct_back_pointers`, `ct_sorted`, `ct_marked`, `ct_holders`, `ct_specs`,
+# `ct_shared_owner`) compare the pointers C gives back with the objects' own.
 
 const CTEST_DIR = joinpath(@__DIR__, "clinkage")
 const HAS_C_TOOLCHAIN = Sys.which("emcc") !== nothing && Sys.which("clang") !== nothing
 HAS_C_TOOLCHAIN || @warn "test/clinkage.jl: emcc or clang not on the PATH: the C linkage tests are skipped (run them in `nix-shell test/clinkage/shell.nix`)"
 
 # the library, as a JLL package declares it: a global variable, set when the package loads to
-# the path of the library (here the native one), which is the library's identity for the C linkage
-global libctest::String = ""
+# the path of the library (here the native one), which is the library's identity for the C
+# linkage; an identity of its own until then (for the tests that only compile)
+global libctest::String = "libctest-not-built"
 
 """
     build_ctest() -> (native library, emscripten module's JavaScript)
@@ -688,6 +695,66 @@ function ct_after_trap(x::Float64)
     return (sum(CT_BUF), ccall((:ct_sum_f64, libctest), Float64, (Ptr{Float64}, Csize_t), CT_BUF, 3))
 end
 
+# empty arrays and strings
+function ct_empties(n::Int)
+    v = Float64[]
+    s = ccall((:ct_sum_f64, libctest), Float64, (Ptr{Float64}, Csize_t), v, 0)
+    e = ccall((:ct_find_f64, libctest), Ptr{Float64}, (Ptr{Float64}, Csize_t, Float64), v, 0, 1.0)
+    off = GC.@preserve v Int(e - pointer(v))
+    z = Int32[]
+    ccall((:ct_fill_i32, libctest), Cvoid, (Ptr{Int32}, Csize_t, Int32), z, 0, Int32(n))
+    h = ccall((:ct_hash, libctest), UInt32, (Cstring,), "")
+    c = ccall((:ct_count_char, libctest), Csize_t, (Cstring, Cchar), "", Cchar('a'))
+    return (s, off, length(z), h, c)
+end
+# arguments that together are more than the stack's share: the rest on the C heap
+function ct_two_big(n::Int)
+    x = collect(1.0:n)
+    y = [i / 2 for i in 1:n]
+    ccall((:ct_add_into, libctest), Cvoid, (Ptr{Float64}, Ptr{Float64}, Csize_t), x, y, n)
+    ccall((:ct_add_into, libctest), Cvoid, (Ptr{Float64}, Ptr{Float64}, Csize_t), y, x, n)
+    return (vdigest(x), vdigest(y))
+end
+# a vector of vectors as an array of pointers (Base makes one), its vectors written by C
+function ct_nested_bufs(n::Int)
+    bufs = [fill(UInt8('a' + i), 3) for i in 1:n]
+    ccall((:ct_reverse_mark, libctest), Cvoid, (Ptr{Ptr{UInt8}}, Cint), bufs, n)
+    return sdigest(join([String(copy(b)) for b in bufs], ","))
+end
+# one object passed directly and through an array of pointers: one copy, both writes back
+function ct_shared_owner(n::Int)
+    buf = fill(UInt8('a'), 4)
+    other = fill(UInt8('b'), n)
+    ptrs = [pointer(buf), pointer(other)]
+    GC.@preserve buf other ccall((:ct_write_both, libctest), Cvoid, (Ptr{UInt8}, Ptr{Ptr{UInt8}}), buf, ptrs)
+    return (sdigest(String(copy(buf))), sdigest(String(copy(other))))
+end
+# a module whose handlers do not read the exception (`:control`): a call's error caught, its
+# space released, later calls right
+function ct_control(n::Int)
+    sp = ccall((:emscripten_stack_get_current, libctest), UInt64, ())
+    v = Any[1.0]
+    x = zeros(n)
+    caught = 0
+    for _ in 1:3
+        try
+            GC.@preserve v ccall((:ct_add_into, libctest), Cvoid, (Ptr{Float64}, Ptr{Float64}, Csize_t), x, pointer(v), 0)
+        catch
+            caught += 1
+        end
+    end
+    fill!(x, 1.5)
+    ccall((:ct_scale_f64, libctest), Cvoid, (Ptr{Float64}, Csize_t, Float64), x, n, 2.0)
+    return (caught, sum(x), ccall((:emscripten_stack_get_current, libctest), UInt64, ()) == sp)
+end
+# `Libc.free` of a pointer into a Julia object does nothing (the object is the collector's;
+# natively freeing it is undefined)
+function ct_free_owned(n::Int)
+    v = collect(1.0:n)
+    GC.@preserve v Libc.free(pointer(v))
+    return sum(v)
+end
+
 @testset "C linkage: pointers into Julia objects" begin
     if HAS_C_TOOLCHAIN
         @ctest ct_refs(Int8(-3), 0x1234, Int32(77), Int64(-9), 1.5f0, 3.25, false)
@@ -708,6 +775,13 @@ end
         @ctest ct_marked(5)
         @ctest ct_marked(4)
         @ctest ct_holders(4)
+        @ctest ct_empties(3)
+        @ctest ct_two_big(1500)
+        @ctest ct_nested_bufs(5)
+        @ctest ct_shared_owner(5)
+        @test ccompile(ct_control, (Int,)).cgm.exceptions === :control
+        @test crun(ct_control, 4) == (3, 12.0, true)
+        @test crun(ct_free_owned, 4) == 10.0
         @test ct_ref_fields_dynamic(2.0) == 1.0
         @test crun(ct_ref_fields_dynamic, 2.0)[1] === :trap
         @test occursin(WasmCodegen.Runtime.CLink.NOT_ADDRESSABLE, LAST_OUTPUT[])
