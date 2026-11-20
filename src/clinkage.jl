@@ -26,10 +26,27 @@ const CLINK_LIBRARY = Runtime.CLink.LIBRARY
 "The C library's functions `Libc` calls (by name, without a library): the C module's allocator's."
 const C_ALLOCATOR_FUNCTIONS = (:malloc, :calloc, :realloc, :free)
 
+"""
+    check_c_host(; long, wchar, word)
+
+Check that the C types of the build host, which bindings declare their signatures and structs
+with (`Clong`, `Cwchar_t`, and struct layouts, which are Julia's: the host's C ABI's), are those
+of wasm64: an LP64 host (`long` 8 bytes, `wchar_t` 4, a 64-bit word: 64-bit Linux, macOS,
+FreeBSD; not Windows, whose `long` is 4 bytes and `wchar_t` 2, nor a 32-bit host).
+"""
+function check_c_host(; long::Int=sizeof(Clong), wchar::Int=sizeof(Cwchar_t), word::Int=Sys.WORD_SIZE)
+    (long == 8 && wchar == 4 && word == 64) || throw(ArgumentError(string(
+        "Config(c_linkage): the build host's C types are not wasm64's (Clong of ", long, " bytes, Cwchar_t of ",
+        wchar, ", a ", word, "-bit word; wasm64 has 8, 4 and 64): bindings declare their types and structs ",
+        "with the host's, so the C linkage needs an LP64 host (64-bit Linux, macOS, FreeBSD)")))
+    return nothing
+end
+
 "Check `Config(c_linkage)`: a 64-bit C module, a host interface without a memory of its own."
 function check_c_linkage(config)
     cl = config.c_linkage
     cl === nothing && return
+    check_c_host()
     cl.memory64 || throw(ArgumentError(string(
         "Config(c_linkage): only C modules with a 64-bit memory (memory64: emscripten's -m64, ",
         "clang's wasm64) are supported, whose pointers and size_t are 8 bytes as Julia's")))

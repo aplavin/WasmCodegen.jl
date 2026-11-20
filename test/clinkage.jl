@@ -404,6 +404,11 @@ end
     @test_throws ArgumentError WasmCodegen.compile(ct_count_more, (); config=ctest_config(memory64=false))
     @test_throws ArgumentError WasmCodegen.compile(ct_count_more, (); config=test_config(import_libraries=[libctest], c_linkage=CLinkage(libraries=[libctest])))
     @test_throws ArgumentError WasmCodegen.compile(ct_count_more, (); config=ctest_config(import_module="julia"))
+    # the build host's C types must be wasm64's (LP64)
+    @test WasmCodegen.check_c_host() === nothing
+    @test_throws "the C linkage needs an LP64 host" WasmCodegen.check_c_host(long=4, wchar=2)
+    @test_throws "Cwchar_t of 2" WasmCodegen.check_c_host(wchar=2)
+    @test_throws "a 32-bit word" WasmCodegen.check_c_host(long=4, word=32)
     # without a C module: no memory, a pointer without owner traps
     c = wcompile(ct_no_linkage, (UInt,))
     @test c.cgm.mod.memory === nothing

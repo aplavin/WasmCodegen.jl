@@ -699,8 +699,18 @@ parser, compared with native JuliaSyntax node for node on Base's sources), each 
 
 `Config(c_linkage = CLinkage(libraries = [...]))` links the module with one C module: a C
 library compiled to Wasm separately, for wasm64 (emscripten's `-m64`, clang's `wasm64`: a
-64-bit memory, memory64, whose pointers, `size_t` and `long` are 8 bytes, so that structs are
-laid out as Julia lays them out on 64-bit platforms). The C module owns the only linear memory:
+64-bit memory, memory64, whose pointers, `size_t` and `long` are 8 bytes and `wchar_t` 4).
+The C types a binding declares are the build host's: its `Clong`, `Cwchar_t` and `Cchar`, and
+its structs laid out by Julia as the host's C ABI lays them out (each field at a multiple of its
+alignment, a primitive aligned to its size: `Int128` to 16). They are wasm64's on an LP64 host
+(64-bit Linux, macOS, FreeBSD), which the C linkage requires (`check_c_host`: an
+`ArgumentError` on Windows, whose `long` is 4 bytes and `wchar_t` 2, or a 32-bit host). One
+difference remains on hosts whose `char` is unsigned (Linux on aarch64, where `Cchar ===
+UInt8`): wasm's clang has a signed `char`, so a `Cchar` argument of 0x80 or more is passed
+zero-extended (as the `UInt8` it is) where C expects it sign-extended: C reading it as an
+`int` sees 128 to 255 instead of -128 to -1 (its `char` value, stored or compared as a `char`,
+is the same). Nothing warns of it: `Cchar` is `UInt8` there, so the code generator cannot tell
+a `char` from an `unsigned char`. The C module owns the only linear memory:
 the module imports it (`import_module.memory`) instead of defining its own, and imports the C
 functions its `ccall`s name (`clinkage.jl`). This is how unmodified bindings run: CImGui.jl's
 `ccall((:igBegin, libcimgui), ...)`, with `libcimgui` a non-constant global a JLL package's
