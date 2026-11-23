@@ -21,6 +21,7 @@ const TRIM_PATCHES = [joinpath(@__DIR__, "trim", "juliac-trim-base.jl"),
                       joinpath(@__DIR__, "trim", "wasm-show.jl"),
                       joinpath(@__DIR__, "trim", "wasm-print.jl"),
                       joinpath(@__DIR__, "trim", "wasm-specialize.jl"),
+                      joinpath(@__DIR__, "trim", "wasm-folded-loops.jl"),
                       joinpath(@__DIR__, "trim", "wasm-invokelatest.jl"),
                       joinpath(@__DIR__, "trim", "wasm-fs.jl")]
 
